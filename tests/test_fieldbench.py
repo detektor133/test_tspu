@@ -5,11 +5,15 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import secrets
+import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
 from generate_report import generate
@@ -76,6 +80,24 @@ class TestFieldReport(unittest.TestCase):
             svg = (root / "charts/throughput.svg").read_text()
             self.assertIn("<svg", svg)
             self.assertIn("VLESS REALITY", svg)
+
+    def test_real_loopback_origin_and_cpu_csv(self):
+        root = Path("/tmp/test-tspu-field-" + secrets.token_hex(8))
+        try:
+            vps_session.start(root, duration=6, size=2048)
+            state = json.loads((root / "session.json").read_text())
+            with urlopen("http://127.0.0.1:18180/payload", timeout=3) as resp:
+                payload = resp.read()
+            self.assertEqual(len(payload), 2048)
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), state["sha256"])
+            time.sleep(1.3)
+            vps_session.stop(root)
+            with (root / "server-resources.csv").open() as stream:
+                entries = list(csv.DictReader(stream))
+            self.assertTrue(entries)
+        finally:
+            vps_session.stop(root)
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_vps_session_path_safety(self):
         with self.assertRaises(SystemExit):
