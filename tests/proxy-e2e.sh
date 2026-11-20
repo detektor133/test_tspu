@@ -111,6 +111,12 @@ for port, kind in required.items():
     if present.get(port) != kind:
         raise SystemExit(f'Не найден профиль {kind}:{port} в подписке')
 expected=set(required) | ({443} if present.get(443)=='vless' else set())
+if present.get(443) == 'vless':
+    reality = next(x for x in proxies if int(x['port']) == 443)
+    if reality.get('flow') != 'xtls-rprx-vision':
+        raise SystemExit('VLESS REALITY без flow=xtls-rprx-vision в подписке')
+    if not isinstance(reality.get('reality-opts'), dict):
+        raise SystemExit('VLESS REALITY без reality-opts в подписке')
 if any(x.get('skip-cert-verify') is True for x in proxies):
     raise SystemExit('Клиентская подписка небезопасно отключает проверку TLS')
 for x in proxies:
