@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Установка Mihomo и m-ui на Ubuntu, без Docker. Сетевые настройки меняются умеренно.
+# Установка Mihomo и m-ui на Ubuntu LTS и Debian с systemd, без Docker.
 set -Eeuo pipefail
 umask 077
 
@@ -64,6 +64,7 @@ usage() {
 --ca-cert ФАЙЛ       : доверенный CA для проверки HTTPS (включая CI).
 --sync-ip            : проверить смену IP и перевыпустить IP-сертификат при необходимости.
 --check              : показать состояние без изменений.
+--check-os           : проверить совместимость ОС, пакетного менеджера и systemd без установки.
 --rollback-tuning    : отменить сетевые оптимизации.
 --firewall --ssh-port ПОРТ : осторожно включить UFW, сохранив указанный SSH-порт.
 
@@ -88,6 +89,7 @@ while (($#)); do
     --firewall) FIREWALL=1; shift ;;
     --ssh-port) (($# >= 2)) || fail 'укажите номер порта'; SSH_PORT="$2"; shift 2 ;;
     --check) MODE='check'; shift ;;
+    --check-os) MODE='check-os'; shift ;;
     --rollback-tuning) MODE='rollback'; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "неизвестный параметр: $1" ;;
@@ -341,6 +343,41 @@ rollback() {
   log 'Сетевые настройки откатили; Mihomo и GUI не удалены.'
 }
 
+# Версионная проверка по семейству, а не по двум фиксированным релизам.
+# Поддерживаем Ubuntu LTS начиная с 22.04 и Debian начиная с 12.
+# На будущих релизах нужен отдельный CI; принятие версии само по себе не гарантия.
+verify_platform() {
+  [[ -r /etc/os-release ]] || fail 'не удалось определить ОС (/etc/os-release)'
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local id="${ID:-}" version="${VERSION_ID:-}"
+  case "$id" in
+    ubuntu)
+      [[ "$version" =~ ^([0-9]{2})[.]04$ ]] ||
+        fail "Ubuntu $version: требуется LTS-релиз 22.04 или новее (XX.04, чётный год)"
+      local release_year="${BASH_REMATCH[1]}"
+      ((10#$release_year >= 22 && 10#$release_year % 2 == 0)) ||
+        fail "Ubuntu $version: требуется LTS-релиз 22.04 или новее"
+      ;;
+    debian)
+      [[ "$version" =~ ^[0-9]+$ ]] ||
+        fail "Debian $version: неподдерживаемый формат версии"
+      ((10#$version >= 12)) || fail "Debian $version: требуется Debian 12 или новее"
+      ;;
+    *) fail "дистрибутив $id не поддерживается; нужен Ubuntu LTS 22.04+ либо Debian 12+" ;;
+  esac
+  command -v apt-get >/dev/null 2>&1 ||
+    fail 'для установки нужен apt-get'
+  command -v dpkg-query >/dev/null 2>&1 ||
+    fail 'для установки нужен dpkg-query'
+  command -v systemctl >/dev/null 2>&1 ||
+    fail 'нужен systemd (systemctl)'
+  [[ -d /run/systemd/system ]] ||
+    fail 'systemd не запущен: требуется VPS с systemd как PID 1 (не обычный Docker-контейнер)'
+  log "Совместимая платформа: ${PRETTY_NAME:-$id $version} (APT + systemd)"
+}
+
+if [[ "$MODE" == check-os ]]; then verify_platform; exit 0; fi
 if [[ "$MODE" == check ]]; then status; exit 0; fi
 if [[ "$MODE" == rollback ]]; then rollback; exit 0; fi
 if [[ "$MODE" == sync-ip ]]; then sync_ip; exit 0; fi
@@ -362,12 +399,7 @@ write_if_changed() {
   return 0
 }
 
-[[ -r /etc/os-release ]] || fail 'не удалось определить ОС'
-# shellcheck disable=SC1091
-. /etc/os-release
-[[ "${ID:-}" == ubuntu ]] || fail 'поддерживается только Ubuntu 22.04/24.04 LTS'
-[[ "${VERSION_ID:-}" == '22.04' || "${VERSION_ID:-}" == '24.04' ]] || fail 'поддерживается только Ubuntu 22.04/24.04 LTS'
-command -v systemctl >/dev/null 2>&1 || fail 'нужен systemd'
+verify_platform
 case "$(uname -m)" in
   x86_64) ARCH='amd64' ;;
   aarch64) ARCH='arm64' ;;
@@ -481,10 +513,32 @@ while IFS='=' read -r key value; do
   fi
 done < "${TMP_DIR}/tuning.conf"
 if ((TUNING_CHANGED || SYSCTL_DRIFT)); then
-  if ! sysctl -p "$TUNING_FILE"; then
-    log 'ПРЕДУПРЕЖДЕНИЕ: некоторые sysctl не применились (ограничения VPS)'
+  SYSCTL_APPLIED=0
+  if sysctl -p "$TUNING_FILE"; then
+    SYSCTL_APPLIED=1
+  else
+    log 'ПРЕДУПРЕЖДЕНИЕ: некоторые sysctl не применились (ограничения ядра или контейнера)'
   fi
-  if ((SYSCTL_DRIFT && !TUNING_CHANGED)); then change 'восстановлены текущие значения sysctl'; fi
+  # Нельзя сообщать об успешном исправлении drift, если sysctl -p завершился ошибкой.
+  if ((SYSCTL_APPLIED)); then
+    # Некоторые контейнеры возвращают код 0, но ядро ограничивает rmem/wmem.
+    # Не считаем восстановление успешным без проверки фактических значений.
+    while IFS='=' read -r key value; do
+      key="${key//[[:space:]]/}"
+      value="${value//[[:space:]]/}"
+      [[ -n "$key" && "${key:0:1}" != '#' ]] || continue
+      if [[ "$(sysctl -n "$key" 2>/dev/null || true)" != "$value" ]]; then
+        SYSCTL_APPLIED=0
+        break
+      fi
+    done < "${TMP_DIR}/tuning.conf"
+    if ((!SYSCTL_APPLIED)); then
+      log 'ПРЕДУПРЕЖДЕНИЕ: ядро ограничивает часть sysctl; повторная попытка не считается изменением'
+    fi
+  fi
+  if ((SYSCTL_DRIFT && !TUNING_CHANGED && SYSCTL_APPLIED)); then
+    change 'восстановлены текущие значения sysctl'
+  fi
 fi
 
 download_verified() {

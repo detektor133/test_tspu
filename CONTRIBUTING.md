@@ -10,11 +10,14 @@
 
 ## Проверки перед слиянием
 
-Обязательны все три проверки GitHub Actions:
+Перед слиянием должны быть зелёными все шесть проверок GitHub Actions:
 
 - `Bash + ShellCheck`;
 - `Установка и HTTPS (ubuntu-22.04)`;
-- `Установка и HTTPS (ubuntu-24.04)`.
+- `Установка и HTTPS (ubuntu-24.04)`;
+- `Установка и HTTPS (ubuntu-26.04)`;
+- `Установка и HTTPS (debian-12)`;
+- `Установка и HTTPS (debian-13)`.
 
 Интеграционный этап ограничен `170s` (запуск runner и checkout в этот лимит не входят). Он проверяет установку, HTTPS, повторный деплой, клиентов, проброс реального HTTP-трафика через каждый протокол и имитацию DuckDNS. **Зелёный CI не означает, что подтверждена работа против ТСПУ** или выпуск публичного Let's Encrypt.
 
@@ -29,7 +32,7 @@
 Это правило должно быть **технически обеспечено**, а не просто записано в Markdown:
 
 1. В `Settings → Rules → Rulesets` создать активный *branch ruleset* для `main`.
-2. Включить **Require a pull request before merging** и **Require status checks to pass**, выбрав три проверки выше.
+2. Включить **Require a pull request before merging** и **Require status checks to pass**, выбрав шесть проверок выше.
 3. Запретить force push, удаление защищённой ветки и обход правил.
 4. В `Settings → General → Pull Requests` разрешить **Squash merging** и при необходимости отключить остальные способы слияния.
 
