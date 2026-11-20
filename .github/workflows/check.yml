@@ -15,7 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Синтаксис Bash
-        run: bash -n deploy.sh tests/integration.sh
+        run: |
+          bash -n deploy.sh
+          bash -n tests/integration.sh
       - name: ShellCheck
         run: shellcheck -S warning deploy.sh tests/integration.sh
       - name: Проверка аргументов и диагностики
