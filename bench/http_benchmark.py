@@ -11,12 +11,13 @@ import hashlib
 import http.client
 import math
 import pathlib
+import secrets
 import statistics
 import ssl
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
 
 HEADERS = [
     'date_utc', 'label', 'concurrency', 'seconds_configured', 'seconds_elapsed',
@@ -45,8 +46,14 @@ def percentile_or_missing(samples, q, minimum):
     return round(percentile(samples, q), 2) if len(samples) >= minimum else ""
 
 
-def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes):
+def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes,
+                 verify_nonce=False):
     start = time.monotonic()
+    start_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    nonce = secrets.token_hex(12) if verify_nonce else ""
+    if verify_nonce:
+        query = urlencode([*parse_qsl(target.query, keep_blank_values=True), ("nonce", nonce)])
+        target = urlsplit(urlunsplit((target.scheme, target.netloc, target.path, query, "")))
     conn = None
     try:
         if proxy is not None:
@@ -95,16 +102,21 @@ def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes):
             raise ValueError(f'HTTP {response.status} или недостаточный размер ответа')
         if digest and digest.hexdigest() != expected_sha256:
             raise ValueError('SHA256 полезной нагрузки не совпал')
-        return (True, count, ttfb, elapsed_ms)
-    except (OSError, TimeoutError, ValueError, http.client.HTTPException, ssl.SSLError):
-        return (False, 0, 0.0, 0.0)
+        if verify_nonce and response.getheader("X-Test-Nonce") != nonce:
+            raise ValueError("ответ не содержит nonce исходного запроса")
+        end_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        return (True, count, ttfb, elapsed_ms, "", nonce, start_utc, end_utc)
+    except (OSError, TimeoutError, ValueError, http.client.HTTPException, ssl.SSLError) as exc:
+        end_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        return (False, 0, 0.0, (time.monotonic() - start) * 1000,
+                type(exc).__name__, nonce, start_utc, end_utc)
     finally:
         if conn is not None:
             conn.close()
 
 
 def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha256, max_bytes,
-              max_requests=None):
+              max_requests=None, on_sample=None, verify_nonce=False):
     completed = []
     lock = threading.Lock()
     started = time.monotonic()
@@ -123,7 +135,17 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
                         budget_limited = True
                     break
                 reserved += 1
-            batch.append(request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes))
+            result = request_once(target, proxy, timeout, min_bytes, expected_sha256,
+                                  max_bytes, verify_nonce=verify_nonce)
+            batch.append(result)
+            if on_sample is not None:
+                on_sample({
+                    "started_utc": result[6], "ended_utc": result[7],
+                    "ok": int(result[0]), "bytes_ok": result[1],
+                    "ttfb_ms": round(result[2], 2) if result[0] else "",
+                    "latency_ms": round(result[3], 2),
+                    "error_type": result[4], "nonce": result[5],
+                })
         with lock:
             completed.extend(batch)
 
