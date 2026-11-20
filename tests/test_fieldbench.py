@@ -65,6 +65,7 @@ class TestFieldReport(unittest.TestCase):
             "status": "ok", "measurement_status": "time_completed",
             "seconds_configured": 6, "seconds_elapsed": 6.03,
             "latency_samples": 25, "requests_ok": 25,
+            "app_rtt_samples": 25, "app_rtt_p95_ms": 123.0,
             "route_status": "verified", "route_packets": 45,
             "raw_samples_complete": True, "controls_passed": True
         }
@@ -75,6 +76,8 @@ class TestFieldReport(unittest.TestCase):
         self.assertFalse(valid_level({**row, "controls_passed": False}))
         self.assertFalse(valid_level({**row, "seconds_elapsed": 1.7}))
         self.assertFalse(valid_level({**row, "latency_samples": 8}))
+        self.assertFalse(valid_level({**row, "app_rtt_samples": 8}))
+        self.assertFalse(valid_level({**row, "app_rtt_p95_ms": ""}))
         self.assertFalse(valid_level({**row, "measurement_status": "budget_limited"}))
         self.assertFalse(valid_level({**row, "measurement_status": ""}))
 
@@ -124,6 +127,8 @@ class TestFieldReport(unittest.TestCase):
                 "seconds_configured": 6, "seconds_elapsed": 6.1,
                 "requests_ok": 20, "requests_total": 20,
                 "bytes_ok": 20 * 1024, "latency_samples": 20,
+                "app_rtt_samples": 20, "app_rtt_failed": 0,
+                "app_rtt_p95_ms": 98,
                 "route_status": "verified", "route_packets": 100
             }]
             self.assertFalse(attach_evidence(root, rows))
@@ -133,12 +138,15 @@ class TestFieldReport(unittest.TestCase):
             }))
             with (root / "request-samples.csv").open("w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=[
-                    "protocol", "concurrency", "ok", "bytes_ok", "nonce"])
+                    "protocol", "concurrency", "kind", "ok", "bytes_ok", "nonce"])
                 writer.writeheader()
                 for i in range(20):
                     writer.writerow({"protocol": "Hysteria2", "concurrency": 4,
-                                     "ok": 1, "bytes_ok": 1024,
+                                     "kind": "download", "ok": 1, "bytes_ok": 1024,
                                      "nonce": ("%024x" % i)})
+                    writer.writerow({"protocol": "Hysteria2", "concurrency": 4,
+                                     "kind": "ping", "ok": 1, "bytes_ok": 0,
+                                     "nonce": ("%024x" % (i + 100))})
             self.assertTrue(attach_evidence(root, rows))
             self.assertTrue(valid_level(rows[0]))
             rows[0]["bytes_ok"] = 999
@@ -279,6 +287,10 @@ class TestFieldReport(unittest.TestCase):
                                    verify_nonce=True)
             self.assertTrue(request[0], request[4])
             self.assertEqual(len(request[5]), 24)
+            ping = request_once(urlsplit("http://127.0.0.1:18180/ping"),
+                                None, 3, 0, None, 0, verify_nonce=True)
+            self.assertTrue(ping[0])
+            self.assertEqual(ping[1], 0)
             # When server-side nonce echo is absent/mismatched, reject even if SHA matches.
             no_nonce = request_once(urlsplit("http://127.0.0.1:18180/payload"),
                                      None, 3, 2048, state["sha256"], 2048,
