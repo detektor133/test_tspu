@@ -226,7 +226,7 @@ run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
 assert_eq "$(sudo cat /var/lib/test-tspu/duckdns-current-ip)" "1.1.1.1"
 run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
   --sync-ip --ip 1.1.1.1 >"$TMP/duckdns-noop.log"
-assert_eq "$(wc -l < "$TMP/duckdns.log")" "2"
+assert_eq "$(sudo cat "$TMP/duckdns.log" | wc -l)" "2"
 
 log "Проверка отката сетевых настроек"
 run_root bash deploy.sh --rollback-tuning >"$TMP/rollback.log"
