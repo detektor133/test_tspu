@@ -627,6 +627,274 @@ if [[ ! -f "$PUBLIC_MARK_FILE" ]] || (( !PUBLIC_LISTEN )); then
   change 'GUI слушает публичный интерфейс по HTTPS'
 fi
 
+# Создаём только отсутствующие inbounds через API m-ui — state.json и config.yaml не редактируем.
+if (( !NO_INBOUNDS )); then
+  [[ -r "$PANEL_DATA/state.json" ]] || fail 'не найдены настройки установленной m-ui'
+  if [[ -n "$PANEL_PASSWORD_SOURCE" ]]; then
+    INBOUND_PASS_FILE="$PANEL_PASSWORD_SOURCE"
+  else
+    INBOUND_PASS_FILE="$PANEL_PASS_FILE"
+  fi
+  [[ -s "$INBOUND_PASS_FILE" ]] ||
+    fail 'для существующей панели укажите --panel-password-file /root/m-ui-password; пароль не сбрасывается'
+  if [[ -n "$PANEL_USER_OVERRIDE" ]]; then
+    INBOUND_PANEL_USER="$PANEL_USER_OVERRIDE"
+  elif [[ -s "$PANEL_USER_FILE" ]]; then
+    INBOUND_PANEL_USER="$(cat "$PANEL_USER_FILE")"
+  else
+    INBOUND_PANEL_USER="$("$PANEL_PATH" settings --data-dir "$PANEL_DATA" | sed -n 's/^username: //p' | head -n1)"
+  fi
+  [[ -n "$INBOUND_PANEL_USER" ]] || fail 'не удалось определить имя пользователя m-ui'
+  export TARGET_HOST CA_CERT_FILE INBOUND_PANEL_USER INBOUND_PASS_FILE
+  export INBOUND_SECRETS_FILE REALITY_TARGET
+  if ! python3 - <<'PY'
+import base64
+import http.cookiejar
+import json
+import os
+import pathlib
+import re
+import secrets
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import uuid
+
+DIR = pathlib.Path('/var/lib/test-tspu')
+PANEL = pathlib.Path('/usr/local/m-ui/data/state.json')
+CORE = '/usr/local/m-ui/mihomo'
+state = json.loads(PANEL.read_text())
+settings = state['settings']
+host = os.environ['TARGET_HOST']
+user = os.environ['INBOUND_PANEL_USER']
+password = pathlib.Path(os.environ['INBOUND_PASS_FILE']).read_text().strip()
+path = '/' + settings['panelPath'].strip('/') + '/'
+ca = os.environ.get('CA_CERT_FILE', '')
+cookies = str(DIR / 'api-session.cookies')
+secret_file = pathlib.Path(os.environ['INBOUND_SECRETS_FILE'])
+sni_override = os.environ.get('REALITY_TARGET', '').strip()
+
+if not password:
+    raise SystemExit('Пустой пароль m-ui')
+
+def api(method, endpoint, payload=None):
+    url = f"https://{host}:2053{path}{endpoint.lstrip('/')}"
+    argv = ['curl', '--silent', '--show-error', '--fail-with-body',
+            '--connect-timeout', '3', '--max-time', '12', '--noproxy', '*',
+            '--resolve', f'{host}:2053:127.0.0.1',
+            '--cookie', cookies, '--cookie-jar', cookies,
+            '--request', method, '--header', 'Content-Type: application/json']
+    if ca:
+        argv.extend(['--cacert', ca])
+    argv.append(url)
+    if payload is not None:
+        argv.extend(['--data-binary', '@-'])
+    result = subprocess.run(argv, input=json.dumps(payload) if payload is not None else None,
+                            capture_output=True, text=True, timeout=16)
+    if result.returncode != 0:
+        raise RuntimeError(f'{endpoint}: HTTP/сеть: {result.stderr[:300]}')
+    try:
+        response = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError(f'{endpoint}: некорректный JSON') from exc
+    if not response.get('ok', response.get('OK', False)):
+        raise RuntimeError(f"{endpoint}: {response.get('message', 'ошибка m-ui')}")
+    return response.get('data', response.get('Data'))
+
+try:
+    api('POST', 'api/auth/login', {'username': user, 'password': password})
+except Exception as exc:
+    raise SystemExit(f'Не удалось войти в m-ui: {exc}. Проверьте --panel-password-file')
+
+# После успешной аутентификации можно безопасно запомнить пароль существующей панели.
+if os.environ['INBOUND_PASS_FILE'] != str(DIR / 'panel-password'):
+    dest = DIR / 'panel-password'
+    tmp = dest.with_suffix('.new')
+    tmp.write_text(password + '\n')
+    tmp.chmod(0o600)
+    tmp.replace(dest)
+dest = DIR / 'panel-user'
+if not dest.exists() or dest.read_text().strip() != user:
+    dest.write_text(user + '\n')
+    dest.chmod(0o600)
+
+existing = api('GET', 'api/inbounds')
+if not isinstance(existing, list):
+    raise SystemExit('m-ui вернула неожиданный список inbounds')
+names = {item.get('name') for item in existing}
+ports = {(item.get('port'), item.get('type')) for item in existing}
+
+managed = {}
+if secret_file.exists():
+    managed = json.loads(secret_file.read_text())
+    if not isinstance(managed, dict):
+        raise SystemExit('Повреждён файл сохранённых секретов inbounds')
+
+def save_secrets():
+    fd, name = tempfile.mkstemp(prefix='.inbound-secrets.', dir=DIR)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(managed, f, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(name, 0o600)
+    os.replace(name, secret_file)
+
+def get_secret(name, field, gen):
+    data = managed.setdefault(name, {})
+    if field not in data:
+        data[field] = gen()
+        save_secrets()
+    return data[field]
+
+def token():
+    return secrets.token_urlsafe(24)
+
+def cert_path(name):
+    path = settings.get(name, '')
+    if not path or not pathlib.Path(path).is_file():
+        raise SystemExit(f'Сертификат панели недоступен: {name}')
+    return path
+
+# Ссылки на текущие TLS-файлы постоянны даже при переходе от IP к домену.
+for source, link in [(cert_path('panelCertFile'), DIR / 'listener-cert.pem'),
+                     (cert_path('panelKeyFile'), DIR / 'listener-key.pem')]:
+    target = pathlib.Path(source).resolve()
+    if link.is_symlink() and link.resolve() == target:
+        continue
+    tmp = link.with_suffix(link.suffix + '.new')
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(target)
+    tmp.replace(link)
+
+crt, key = str(DIR / 'listener-cert.pem'), str(DIR / 'listener-key.pem')
+
+def ready_reality_target():
+    candidates = [sni_override] if sni_override else [
+        'www.microsoft.com', 'www.cloudflare.com', 'www.apple.com']
+    for name in candidates:
+        if not re.fullmatch(r'[A-Za-z0-9.-]{4,200}', name):
+            continue
+        try:
+            result = subprocess.run(['openssl', 's_client', '-connect', name + ':443',
+                                     '-servername', name, '-tls1_3', '-verify_return_error',
+                                     '-verify_hostname', name, '-brief'],
+                                    input='', text=True, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=4)
+            if result.returncode == 0:
+                return name
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+def reality_key():
+    result = subprocess.run([CORE, 'generate', 'reality-keypair'],
+                            capture_output=True, text=True, timeout=5)
+    text = result.stdout + '\n' + result.stderr
+    m = re.search(r'PrivateKey:\s*(\S+)', text)
+    pub = re.search(r'PublicKey:\s*(\S+)', text)
+    if result.returncode or not m or not pub:
+        raise RuntimeError('Mihomo не смог создать Reality keypair')
+    return {'private': m.group(1), 'public': pub.group(1)}
+
+def is_tcp(item):
+    return item.get('type') not in ('hysteria2', 'tuic')
+def add(inbound):
+    name, port = inbound['name'], inbound['port']
+    if name in names:
+        print(f'Без изменений: {name}')
+        return
+    # Сервис или другой inbound не должен перехватывать порт.
+    protocol = 'tcp' if is_tcp(inbound) else 'udp'
+    for x in existing:
+        if int(x.get('port') or 0) == port:
+            existing_protocol = 'tcp' if is_tcp(x) else 'udp'
+            if existing_protocol == protocol:
+                raise RuntimeError(f'порт {port}/{protocol} занят inbound {x.get("name")}')
+    # Явный пробный bind проверяет сторонние процессы (не создаёт запись).
+    import socket
+    family = socket.SOCK_STREAM if protocol == 'tcp' else socket.SOCK_DGRAM
+    sock = socket.socket(socket.AF_INET, family)
+    try:
+        sock.bind(('0.0.0.0', port))
+    except OSError as exc:
+        raise RuntimeError(f'порт {port}/{protocol} недоступен: {exc}') from exc
+    finally:
+        sock.close()
+    api('POST', 'api/inbounds/import', {'yaml': json.dumps(inbound)})
+    names.add(name)
+    existing.append(inbound)
+    print(f'Создан inbound: {name} на {port}/{protocol}')
+
+# Семь независимых вариантов с уникальными секретами и стабильными именами.
+ssname = 'test-tspu-ss'
+sspw = get_secret(ssname, 'password', token)
+add({'name': ssname, 'type': 'shadowsocks', 'port': 8388, 'listen': '0.0.0.0',
+     'cipher': 'chacha20-ietf-poly1305', 'password': sspw, 'udp': True})
+
+hyname = 'test-tspu-hysteria2'
+hypw = get_secret(hyname, 'password', token)
+add({'name': hyname, 'type': 'hysteria2', 'port': 443, 'listen': '0.0.0.0',
+     'users': {'test': hypw}, 'alpn': ['h3'], 'certificate': crt, 'private-key': key,
+     'up': 1000, 'down': 1000})
+
+tuicname = 'test-tspu-tuic'
+tuic_uuid = get_secret(tuicname, 'uuid', lambda: str(uuid.uuid4()))
+tuic_pw = get_secret(tuicname, 'password', token)
+add({'name': tuicname, 'type': 'tuic', 'port': 8443, 'listen': '0.0.0.0',
+     'users': {tuic_uuid: tuic_pw}, 'alpn': ['h3'], 'congestion-controller': 'bbr',
+     'certificate': crt, 'private-key': key})
+
+trname = 'test-tspu-trojan'
+trpw = get_secret(trname, 'password', token)
+add({'name': trname, 'type': 'trojan', 'port': 9443, 'listen': '0.0.0.0',
+     'users': [{'username': 'test', 'password': trpw}],
+     'certificate': crt, 'private-key': key})
+
+atname = 'test-tspu-anytls'
+atpw = get_secret(atname, 'password', token)
+add({'name': atname, 'type': 'anytls', 'port': 10443, 'listen': '0.0.0.0',
+     'users': {'test': atpw}, 'certificate': crt, 'private-key': key})
+
+xhname = 'test-tspu-vless-xhttp'
+xhuuid = get_secret(xhname, 'uuid', lambda: str(uuid.uuid4()))
+xhpath = get_secret(xhname, 'path', lambda: '/' + secrets.token_hex(8))
+add({'name': xhname, 'type': 'vless', 'port': 11443, 'listen': '0.0.0.0',
+     'users': [{'username': 'test', 'uuid': xhuuid}],
+     'xhttp-config': {'path': xhpath, 'mode': 'auto'},
+     'certificate': crt, 'private-key': key})
+
+rname = 'test-tspu-reality'
+if rname not in names:
+    sni = ready_reality_target()
+    if sni:
+        rkeys = managed.get(rname, {})
+        if 'private' not in rkeys:
+            rkeys = reality_key()
+            managed[rname] = rkeys
+            save_secrets()
+        r_uuid = get_secret(rname, 'uuid', lambda: str(uuid.uuid4()))
+        short_id = get_secret(rname, 'short_id', lambda: secrets.token_hex(8))
+        add({'name': rname, 'type': 'vless', 'port': 443, 'listen': '0.0.0.0',
+             'users': [{'username': 'test', 'uuid': r_uuid, 'flow': 'xtls-rprx-vision'}],
+             'reality-config': {'dest': sni + ':443', 'private-key': rkeys['private'],
+                                'server-names': [sni], 'short-id': [short_id]}})
+    else:
+        print('REALITY: не найден проверенный TLS-сайт; inbound не создан')
+else:
+    print('Без изменений: REALITY')
+
+api('POST', 'api/core/test')
+# m-ui сохраняет inbounds в state; ядро применяет после контролируемого перезапуска.
+print('Готово: inbounds сохранены через m-ui API')
+PY
+  then
+    fail 'автоматическая настройка inbound завершилась ошибкой (проверьте вывод выше)'
+  fi
+fi
+
 # Для проверки IP после перезапуска используется собственная актуальная копия скрипта.
 [[ -f "${BASH_SOURCE[0]}" ]] || fail 'запускайте скачанный файл, не передавайте код через stdin'
 write_if_changed "${BASH_SOURCE[0]}" "$SELF_PATH" 0700 || true
