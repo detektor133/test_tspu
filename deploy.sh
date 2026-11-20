@@ -459,17 +459,34 @@ systemctl is-active --quiet m-ui.service || fail 'm-ui не работает'
 
 PREV_MODE="$(cat "$MODE_FILE" 2>/dev/null || true)"
 PREV_HOST="$(cat "$HOST_FILE" 2>/dev/null || true)"
-if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" || -n "$CERT_FILE" ]] || { [[ "$TARGET_MODE" == ip && "$(cat "$CERT_MODE_FILE" 2>/dev/null || true)" != custom && ! -s /root/cert/ip/fullchain.pem ]]; }; then
+PREV_CERT_MODE="$(cat "$CERT_MODE_FILE" 2>/dev/null || true)"
+TLS_UPDATE=0
+if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" ]]; then
+  TLS_UPDATE=1
+elif [[ -n "$CERT_FILE" ]] && { [[ "$PREV_CERT_MODE" != custom ]] || \
+      ! cmp -s "$CERT_FILE" "$CUSTOM_CERT" || ! cmp -s "$KEY_FILE" "$CUSTOM_KEY"; }; then
+  TLS_UPDATE=1
+elif [[ "$TARGET_MODE" == ip && "$PREV_CERT_MODE" != custom && ! -s /root/cert/ip/fullchain.pem ]]; then
+  TLS_UPDATE=1
+fi
+if ((TLS_UPDATE)); then
   if [[ -n "$CERT_FILE" ]]; then
-    log "Устанавливаю предоставленный TLS-сертификат: $TARGET_HOST"
-    bash "$INSTALLER_CACHE" --ssl-menu --cert "$CERT_FILE" --key "$KEY_FILE" || fail "Не удалось применить TLS-сертификат"
+    log "Применяю TLS-сертификат: $TARGET_HOST"
+    if ! cmp -s "$CERT_FILE" "$CUSTOM_CERT"; then
+      write_if_changed "$CERT_FILE" "$CUSTOM_CERT" 0644 || true
+    fi
+    if ! cmp -s "$KEY_FILE" "$CUSTOM_KEY"; then
+      write_if_changed "$KEY_FILE" "$CUSTOM_KEY" 0600 || true
+    fi
+    bash "$INSTALLER_CACHE" --ssl-menu --cert "$CUSTOM_CERT" --key "$CUSTOM_KEY" ||
+      fail 'не удалось применить TLS-сертификат; проверьте настройки m-ui'
   else
-    if ss -H -ltn 'sport = :80' | grep -q .; then fail "TCP 80 занят — ACME HTTP-01 не сможет пройти"; fi
+    if ss -H -ltn 'sport = :80' | grep -q .; then fail 'TCP 80 занят — ACME HTTP-01 не сможет пройти'; fi
     log "Выпускаю TLS-сертификат: $TARGET_HOST"
     if [[ "$TARGET_MODE" == ip ]]; then
-      bash "$INSTALLER_CACHE" --ssl-menu --ssl-ip "$TARGET_HOST" || fail "IP-сертификат не выпущен; GUI остаётся локальным"
+      bash "$INSTALLER_CACHE" --ssl-menu --ssl-ip "$TARGET_HOST" || fail 'не удалось выпустить IP-сертификат'
     else
-      bash "$INSTALLER_CACHE" --ssl-menu --ssl-domain "$TARGET_HOST" || fail "Доменный сертификат не выпущен; GUI остаётся локальным"
+      bash "$INSTALLER_CACHE" --ssl-menu --ssl-domain "$TARGET_HOST" || fail 'не удалось выпустить сертификат домена'
     fi
   fi
   printf '%s\n' "$TARGET_MODE" > "${MODE_FILE}.new"
@@ -477,22 +494,34 @@ if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" || -n "$C
   mv -f "${MODE_FILE}.new" "$MODE_FILE"
   mv -f "${HOST_FILE}.new" "$HOST_FILE"
   if [[ -n "$CERT_FILE" ]]; then printf 'custom\n' > "$CERT_MODE_FILE"; else printf 'acme\n' > "$CERT_MODE_FILE"; fi
-fi
-
-# Не публикуем HTTP GUI до успешного HTTPS.
-systemctl stop m-ui.service
-/usr/local/m-ui/m-ui configure --data-dir /usr/local/m-ui/data --listen-ip 0.0.0.0 >/dev/null
-systemctl reset-failed m-ui.service 2>/dev/null || true
-systemctl start m-ui.service
-systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился после активации HTTPS'
-
-# Сохраняем локальную копию единственного установочного файла для автопроверки смены IP.
-if [[ -f "${BASH_SOURCE[0]}" ]]; then
-  install -m 0700 "${BASH_SOURCE[0]}" "$SELF_PATH"
+  change "HTTPS для $TARGET_HOST"
 else
-  fail 'Нужно запускать скачанный файл, а не поток в bash'
+  log "Без изменений: TLS для $TARGET_HOST"
 fi
-cat > /etc/systemd/system/test-tspu-ip-check.service <<'UNIT'
+
+# Административная панель публикуется только после установки HTTPS.
+# Проверяем реальный listening socket, чтобы исправить drift даже при наличии marker.
+PUBLIC_LISTEN=0
+if ss -H -ltn 'sport = :2053' | grep -Eq '0[.]0[.]0[.]0:2053|\*:2053|\[::\]:2053'; then
+  PUBLIC_LISTEN=1
+fi
+if [[ ! -f "$PUBLIC_MARK_FILE" ]] || (( !PUBLIC_LISTEN )); then
+  systemctl stop m-ui.service
+  "$PANEL_PATH" configure --data-dir "$PANEL_DATA" --listen-ip 0.0.0.0 >/dev/null
+  systemctl reset-failed m-ui.service 2>/dev/null || true
+  if ! systemctl start m-ui.service; then
+    rollback_core
+    fail 'm-ui не запустился после настройки публичного HTTPS'
+  fi
+  printf '%s\n' '0.0.0.0' > "$PUBLIC_MARK_FILE"
+  change 'GUI слушает публичный интерфейс по HTTPS'
+fi
+
+# Для проверки IP после перезапуска используется собственная актуальная копия скрипта.
+[[ -f "${BASH_SOURCE[0]}" ]] || fail 'запускайте скачанный файл, не передавайте код через stdin'
+write_if_changed "${BASH_SOURCE[0]}" "$SELF_PATH" 0700 || true
+
+cat > "${TMP_DIR}/ip-check.service" <<'UNIT'
 [Unit]
 Description=Проверка IP для сертификата m-ui
 After=network-online.target m-ui.service
@@ -501,7 +530,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/sbin/test-tspu-deploy --sync-ip
 UNIT
-cat > /etc/systemd/system/test-tspu-ip-check.timer <<'UNIT'
+cat > "${TMP_DIR}/ip-check.timer" <<'UNIT'
 [Unit]
 Description=Проверка смены IP и обновление HTTPS-панели
 [Timer]
@@ -512,8 +541,21 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
-systemctl daemon-reload
-systemctl enable --now test-tspu-ip-check.timer
+TIMER_CHANGED=0
+if write_if_changed "${TMP_DIR}/ip-check.service" /etc/systemd/system/test-tspu-ip-check.service; then TIMER_CHANGED=1; fi
+if write_if_changed "${TMP_DIR}/ip-check.timer" /etc/systemd/system/test-tspu-ip-check.timer; then TIMER_CHANGED=1; fi
+if ((TIMER_CHANGED)); then systemctl daemon-reload; fi
+if ! systemctl is-enabled --quiet test-tspu-ip-check.timer; then
+  systemctl enable test-tspu-ip-check.timer
+  change 'включён таймер проверки IP'
+fi
+if ! systemctl is-active --quiet test-tspu-ip-check.timer; then
+  systemctl start test-tspu-ip-check.timer
+  change 'запущен таймер проверки IP'
+elif ((TIMER_CHANGED)); then
+  systemctl restart test-tspu-ip-check.timer
+  change 'перезапущен таймер после изменения конфигурации'
+fi
 
 
 if ((FIREWALL)); then
