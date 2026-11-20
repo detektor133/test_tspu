@@ -252,7 +252,7 @@ run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
   >"$TMP/duckdns-install.log" 2>&1 || { cat "$TMP/duckdns-install.log"; exit 1; }
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "example.duckdns.org"
 assert_eq "$(sudo cat /var/lib/test-tspu/duckdns-current-ip)" "8.8.8.8"
-sudo stat -c %a /var/lib/test-tspu/duckdns-token | grep -qx 600
+assert_eq "$(sudo stat -c %a /var/lib/test-tspu/duckdns-token)" "600"
 check_https example.duckdns.org
 run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
   --sync-ip --ip 1.1.1.1 >"$TMP/duckdns-sync.log" 2>&1 || {
