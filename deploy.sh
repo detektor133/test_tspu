@@ -199,6 +199,43 @@ update_duckdns() {
   log "DuckDNS: $name.duckdns.org → $current_ip"
 }
 
+# Обновляем копии сертификатов в SAFE_PATHS Mihomo после ACME-продления,
+# не перезапуская панель, когда файлы не менялись.
+sync_listener_tls() {
+  [[ -s /usr/local/m-ui/data/state.json ]] || return 0
+  local status=0
+  python3 - <<'PY' || status=$?
+import json, os, pathlib, tempfile, sys
+state = json.load(open('/usr/local/m-ui/data/state.json'))
+settings = state.get('settings', {})
+target_dir = pathlib.Path('/usr/local/m-ui/data/test-tspu-tls')
+pairs = [('panelCertFile', 'fullchain.pem'), ('panelKeyFile', 'privkey.pem')]
+if not all(settings.get(field) and pathlib.Path(settings[field]).is_file() for field, _ in pairs):
+    sys.exit(0)
+target_dir.mkdir(mode=0o700, exist_ok=True)
+changed = False
+for field, dest in pairs:
+    src = pathlib.Path(settings[field]).read_bytes()
+    output = target_dir / dest
+    if output.is_file() and output.read_bytes() == src:
+        continue
+    fd, name = tempfile.mkstemp(prefix='.tls-', dir=target_dir)
+    with os.fdopen(fd, 'wb') as fp:
+        fp.write(src)
+    os.chmod(name, 0o600)
+    os.replace(name, output)
+    changed = True
+sys.exit(10 if changed else 0)
+PY
+  if ((status == 10)); then
+    log 'TLS-сертификат listener обновлён; перезапускаю Mihomo через m-ui'
+    systemctl reset-failed m-ui.service 2>/dev/null || true
+    systemctl restart m-ui.service || fail 'не удалось перезапустить m-ui после обновления TLS'
+  elif ((status != 0)); then
+    fail 'не удалось синхронизировать сертификат Mihomo'
+  fi
+}
+
 # Обновление сертификата: выполняется только если IP действительно поменялся.
 sync_ip() {
   require_root
@@ -211,6 +248,7 @@ sync_ip() {
     else
       log 'Для домена сертификат привязан к имени; обновите DNS при смене IP.'
     fi
+    sync_listener_tls
     return 0
   fi
   [[ -r "$INSTALLER_CACHE" ]] || fail "не найден $INSTALLER_CACHE"
@@ -218,7 +256,7 @@ sync_ip() {
   old="$(cat "$HOST_FILE")"
   next="${IP_OVERRIDE:-$(detect_ip)}" || fail 'не получилось определить новый IP'
   is_public_ipv4 "$next" || fail 'нужен публичный IPv4'
-  if [[ "$old" == "$next" ]]; then log "IP не изменился: $next"; return 0; fi
+  if [[ "$old" == "$next" ]]; then log "IP не изменился: $next"; sync_listener_tls; return 0; fi
   if ss -H -ltn 'sport = :80' | grep -q .; then fail 'TCP 80 занят — ACME HTTP-01 не сможет пройти; освободите порт'; fi
   log "Новый IP: $old → $next. Запрашиваю сертификат Let's Encrypt..."
   if bash "$INSTALLER_CACHE" --ssl-menu --ssl-ip "$next"; then
