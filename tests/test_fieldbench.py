@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
-from generate_report import generate
+from generate_report import generate, valid_level
 from http_benchmark import HEADERS, run_level, percentile_or_missing
 from compare_runs import combine
 import vps_session
@@ -56,6 +56,18 @@ class TestFieldReport(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_valid_level_requires_complete_time_and_sufficient_sample(self):
+        row = {
+            "status": "ok", "measurement_status": "time_completed",
+            "seconds_configured": 6, "seconds_elapsed": 6.03,
+            "latency_samples": 25, "requests_ok": 25
+        }
+        self.assertTrue(valid_level(row))
+        self.assertFalse(valid_level({**row, "seconds_elapsed": 1.7}))
+        self.assertFalse(valid_level({**row, "latency_samples": 8}))
+        self.assertFalse(valid_level({**row, "measurement_status": "budget_limited"}))
+        self.assertFalse(valid_level({**row, "measurement_status": ""}))
 
     def test_no_false_percentiles_from_tiny_samples(self):
         self.assertEqual(percentile_or_missing([1] * 19, .95, 20), "")
@@ -168,6 +180,8 @@ class TestFieldReport(unittest.TestCase):
                 })
             report = generate(root).read_text()
             self.assertIn("3/4", report)
+            self.assertIn("unverified_legacy", report)
+            self.assertIn("Пробный/неполный прогон", report)
             self.assertIn("0.003", report)
             self.assertIn("Не измерены или недоступны профили", report)
             self.assertNotIn("успешно обходит ТСПУ", report)
