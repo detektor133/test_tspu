@@ -27,10 +27,14 @@ jobs:
           bash -n deploy.sh
           bash -n tests/integration.sh
           bash -n tests/proxy-e2e.sh
+          bash -n bench/setup_termux.sh
       - name: Проверка Python-скриптов измерений
-        run: python3 -m py_compile bench/*.py
+        run: |
+          python3 -m py_compile bench/*.py
+          python3 -m py_compile tests/test_fieldbench.py
+          python3 -m unittest discover -s tests -p 'test_fieldbench.py' -v
       - name: ShellCheck
-        run: shellcheck -S warning deploy.sh tests/integration.sh tests/proxy-e2e.sh
+        run: shellcheck -S warning deploy.sh bench/setup_termux.sh tests/integration.sh tests/proxy-e2e.sh
       - name: Проверка аргументов и диагностики
         run: |
           bash deploy.sh --help
