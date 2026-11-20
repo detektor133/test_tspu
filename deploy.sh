@@ -263,6 +263,7 @@ sync_ip() {
     [[ -s /root/cert/ip/fullchain.pem ]] || fail 'не обнаружен установленный сертификат'
     printf '%s\n' "$next" > "${HOST_FILE}.new"
     mv -f "${HOST_FILE}.new" "$HOST_FILE"
+    sync_listener_tls
     if [[ -x /root/.acme.sh/acme.sh ]]; then
       /root/.acme.sh/acme.sh --remove -d "$old" >/dev/null 2>&1 || log 'Не удалось исключить старый IP из автопродления.'
     fi
@@ -865,10 +866,9 @@ def add(inbound):
     # Сервис или другой inbound не должен перехватывать порт.
     protocol = 'tcp' if is_tcp(inbound) else 'udp'
     for x in existing:
+        # m-ui резервирует номер порта целиком, даже если транспорт другой.
         if int(x.get('port') or 0) == port:
-            existing_protocol = 'tcp' if is_tcp(x) else 'udp'
-            if existing_protocol == protocol:
-                raise RuntimeError(f'порт {port}/{protocol} занят inbound {x.get("name")}')
+            raise RuntimeError(f'номер порта {port} занят inbound {x.get("name")}')
     # Явный пробный bind проверяет сторонние процессы (не создаёт запись).
     import socket
     family = socket.SOCK_STREAM if protocol == 'tcp' else socket.SOCK_DGRAM
