@@ -717,7 +717,7 @@ if (( !NO_INBOUNDS )); then
   fi
   [[ -n "$INBOUND_PANEL_USER" ]] || fail 'не удалось определить имя пользователя m-ui'
   export TARGET_HOST CA_CERT_FILE INBOUND_PANEL_USER INBOUND_PASS_FILE
-  export INBOUND_SECRETS_FILE REALITY_TARGET
+  export INBOUND_SECRETS_FILE REALITY_TARGET PANEL_BOOTSTRAP
   export API_COOKIE_FILE="${TMP_DIR}/api-session.cookies"
   export INBOUNDS_COUNT_FILE="${TMP_DIR}/inbounds-created-count"
   if ! python3 - <<'PY'
@@ -993,6 +993,16 @@ if created_count or tls_changed:
     print(f'Mihomo: применено новых inbounds: {created_count}; TLS обновлён: {tls_changed}')
 # m-ui сохраняет inbounds в state, изменения применяются через API.
 pathlib.Path(os.environ['INBOUNDS_COUNT_FILE']).write_text(str(created_count))
+# HAPP в m-ui v0.3.3 выключен по умолчанию. Включаем
+# только у вновь установленной панели, не меняя настройки существующих.
+if os.environ.get('PANEL_BOOTSTRAP') == '1':
+    cfg = api('GET', 'api/config')
+    toggles = cfg.setdefault('subscriptionClients', {})
+    if not toggles.get('happ', False):
+        toggles['happ'] = True
+        api('PUT', 'api/config', cfg)
+        print('Для новой панели включена Android-подписка HAPP')
+
 # m-ui умеет отдавать клиентские ссылки, Clash/Mihomo YAML и QR-страницу.
 # Важно: API /api/subscriptions/token каждый раз перевыпускает токен — не вращаем его.
 # Общий пользователь test применяется в семи созданных inbounds.
@@ -1014,6 +1024,7 @@ for subscription_user in ('test', 'default'):
     else:
         print(f'Без изменений: подписка пользователя {subscription_user}')
 settings = json.loads(PANEL.read_text())['settings']
+happ_enabled = bool((settings.get('subscriptionClients') or {}).get('happ'))
 subpath = '/' + (settings.get('subscriptionPath') or '').strip('/')
 subpath = subpath.rstrip('/')
 clashpath = '/' + (settings.get('clashPath') or 'clash').strip('/')
@@ -1030,9 +1041,10 @@ for subscription_user, token_value in sorted(tokens.items()):
         f'QR/страница: {base}',
         f'Mihomo/Clash: {base}{clashpath}',
         f'Android v2rayNG: {base}/v2rayng',
-        f'Android HAPP: {base}/happ',
         f'sing-box: {base}/sing-box',
     ])
+    if happ_enabled:
+        lines.append(f'Android HAPP: {base}/happ')
 dest = DIR / 'subscriptions.txt'
 new_content = '\n'.join(lines) + '\n'
 if not dest.exists() or dest.read_text() != new_content:
