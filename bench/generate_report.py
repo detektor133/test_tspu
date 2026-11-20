@@ -203,14 +203,14 @@ def generate(folder):
     throughput = [(label, max((num(r.get("throughput_mib_s")) for r in by_label[label]
                                if valid_level(r)), default=0.0))
                   for label in ORDER]
-    latency = [(label, min((num(r.get("latency_p95_ms")) for r in by_label[label]
-                            if valid_level(r) and r.get("latency_p95_ms") not in ('', None)), default=0.0))
+    latency = [(label, min((num(r.get("app_rtt_p95_ms")) for r in by_label[label]
+                            if valid_level(r) and r.get("app_rtt_p95_ms") not in ('', None)), default=0.0))
                for label in ORDER]
     # Zero on a chart means "no successful observation" rather than a measured 0 ms.
     charts = folder / "charts"
     charts.mkdir(exist_ok=True)
     chart(charts / "throughput.svg", "Скорость: только полные интервалы и достаточно выборок", throughput, "МиБ/с")
-    chart(charts / "latency.svg", "p95: только полные интервалы (0 = нет данных)", latency, "мс")
+    chart(charts / "latency.svg", "HTTP ping под нагрузкой: p95 (0 = нет данных)", latency, "мс")
     total_bytes = sum(transferred.values())
     all_requests = sum(totals.values())
     all_ok = sum(successful.values())
@@ -244,6 +244,12 @@ def generate(folder):
         "это не ICMP RTT. p95 загрузки 256 КиБ измеряется отдельно.",
         "budget_limited: бюджет кончился раньше таймера; скорость за фактический интервал "
         "не является устойчивой скоростью за заданные секунды.",
+        "insufficient_samples / insufficient_rtt_samples: полный интервал, но менее 20 "
+        "успешных загрузок или запросов /ping; "
+        "для p95 требуется >=20, для p99 >=100. Недостаточные процентили показаны как «—».",
+        "Присутствие route_ambiguous/no_ingress либо errors_observed не доказывает DPI; "
+        "требуются независимые повторные проверки.",
+        "Старые CSV без исходных HTTP ping и port evidence не признаются полноценно проверенными.",
         "insufficient_samples: до конца таймера дошли, но получено меньше 20 успешных ответов; "
         "для p95 требуется >=20, для p99 >=100. Недостаточные процентили показаны как «—».",
         "Пассивные счётчики порта VPS не аутентифицируют IP отправителя: при стороннем трафике "
