@@ -15,6 +15,9 @@ SSH_PORT=''
 MODE='install'
 DOMAIN=''
 IP_OVERRIDE=''
+CERT_FILE=''
+KEY_FILE=''
+CA_CERT_FILE=''
 SELF_PATH='/usr/local/sbin/test-tspu-deploy'
 INSTALLER_CACHE="${DATA_DIR}/m-ui-upstream-install.sh"
 HOST_FILE="${DATA_DIR}/panel-host"
@@ -30,6 +33,9 @@ usage() {
 
 --domain ИМЯ         : панель по домену; запись A должна указывать на VPS.
 --ip АДРЕС           : явно задать публичный IPv4 вместо автоопределения.
+--cert-file ФАЙЛ     : использовать готовый TLS-сертификат (без ACME).
+--key-file ФАЙЛ      : приватный ключ готового сертификата.
+--ca-cert ФАЙЛ       : доверенный CA для проверки HTTPS (включая CI).
 --sync-ip            : проверить смену IP и перевыпустить IP-сертификат при необходимости.
 --check              : показать состояние без изменений.
 --rollback-tuning    : отменить сетевые оптимизации.
@@ -43,6 +49,9 @@ while (($#)); do
   case "$1" in
     --domain) (($# >= 2)) || fail 'укажите имя домена'; DOMAIN="$2"; shift 2 ;;
     --ip) (($# >= 2)) || fail 'укажите IPv4'; IP_OVERRIDE="$2"; shift 2 ;;
+    --cert-file) (($# >= 2)) || fail 'укажите файл сертификата'; CERT_FILE="$2"; shift 2 ;;
+    --key-file) (($# >= 2)) || fail 'укажите файл ключа'; KEY_FILE="$2"; shift 2 ;;
+    --ca-cert) (($# >= 2)) || fail 'укажите файл доверенного CA'; CA_CERT_FILE="$2"; shift 2 ;;
     --sync-ip) MODE='sync-ip'; shift ;;
     --firewall) FIREWALL=1; shift ;;
     --ssh-port) (($# >= 2)) || fail 'укажите номер порта'; SSH_PORT="$2"; shift 2 ;;
@@ -53,6 +62,12 @@ while (($#)); do
   esac
 done
 [[ -z "$DOMAIN" || -z "$IP_OVERRIDE" ]] || fail 'одновременно --domain и --ip недопустимы'
+[[ -z "$CERT_FILE" && -z "$KEY_FILE" || -n "$CERT_FILE" && -n "$KEY_FILE" ]] || fail '--cert-file и --key-file нужны вместе'
+[[ -z "$CA_CERT_FILE" || -n "$CERT_FILE" ]] || fail '--ca-cert применяется с --cert-file'
+if [[ -n "$CERT_FILE" ]]; then
+  [[ -s "$CERT_FILE" && -r "$CERT_FILE" && -s "$KEY_FILE" && -r "$KEY_FILE" ]] || fail 'сертификат/ключ недоступны'
+fi
+[[ -z "$CA_CERT_FILE" || -s "$CA_CERT_FILE" && -r "$CA_CERT_FILE" ]] || fail 'файл CA недоступен'
 
 is_ipv4() {
   local ip="$1" a b c d v
@@ -222,8 +237,14 @@ if [[ ! -f "${DATA_DIR}/before.txt" ]]; then
 fi
 
 log 'Устанавливаю системные зависимости'
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl openssl gzip tar procps iproute2 kmod cron socat
+missing_packages=()
+for dep in ca-certificates curl openssl gzip tar procps iproute2 kmod cron socat; do
+  if ! dpkg -s "$dep" >/dev/null 2>&1; then missing_packages+=("$dep"); fi
+done
+if ((${#missing_packages[@]})); then
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing_packages[@]}"
+fi
 # Определяем внешний IP только после установки curl.
 get_target
 log "TLS-адрес панели: $TARGET_HOST ($TARGET_MODE)"
@@ -232,7 +253,7 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: 
   ufw allow 80/tcp comment 'ACME test-tspu'
   ufw allow "${PANEL_PORT}/tcp" comment 'HTTPS m-ui test-tspu'
 fi
-if [[ "$TARGET_MODE" == domain ]]; then
+if [[ "$TARGET_MODE" == domain && -z "$CERT_FILE" ]]; then
   # Проверка информативна: DNS-провайдер может возвращать несколько адресов.
   PUBLIC_IP="$(detect_ip)" || fail 'не удаётся определить IP для проверки DNS'
   if ! getent ahostsv4 "$TARGET_HOST" | awk '{print $1}' | grep -Fx "$PUBLIC_IP" >/dev/null; then
@@ -331,13 +352,18 @@ systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился
 
 PREV_MODE="$(cat "$MODE_FILE" 2>/dev/null || true)"
 PREV_HOST="$(cat "$HOST_FILE" 2>/dev/null || true)"
-if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" ]] || { [[ "$TARGET_MODE" == ip && ! -s /root/cert/ip/fullchain.pem ]]; }; then
-  if ss -H -ltn 'sport = :80' | grep -q .; then fail 'TCP 80 занят — ACME HTTP-01 не сможет пройти; освободите порт'; fi
-  log "Выпускаю TLS-сертификат: $TARGET_HOST"
-  if [[ "$TARGET_MODE" == ip ]]; then
-    bash "$INSTALLER_CACHE" --ssl-menu --ssl-ip "$TARGET_HOST" || fail 'IP-сертификат не выпущен; GUI остаётся локальным'
+if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" || -n "$CERT_FILE" ]] || { [[ "$TARGET_MODE" == ip && ! -s /root/cert/ip/fullchain.pem ]]; }; then
+  if [[ -n "$CERT_FILE" ]]; then
+    log "Устанавливаю предоставленный TLS-сертификат: $TARGET_HOST"
+    bash "$INSTALLER_CACHE" --ssl-menu --cert "$CERT_FILE" --key "$KEY_FILE" || fail "Не удалось применить TLS-сертификат"
   else
-    bash "$INSTALLER_CACHE" --ssl-menu --ssl-domain "$TARGET_HOST" || fail 'доменный сертификат не выпущен; GUI остаётся локальным'
+    if ss -H -ltn 'sport = :80' | grep -q .; then fail "TCP 80 занят — ACME HTTP-01 не сможет пройти"; fi
+    log "Выпускаю TLS-сертификат: $TARGET_HOST"
+    if [[ "$TARGET_MODE" == ip ]]; then
+      bash "$INSTALLER_CACHE" --ssl-menu --ssl-ip "$TARGET_HOST" || fail "IP-сертификат не выпущен; GUI остаётся локальным"
+    else
+      bash "$INSTALLER_CACHE" --ssl-menu --ssl-domain "$TARGET_HOST" || fail "Доменный сертификат не выпущен; GUI остаётся локальным"
+    fi
   fi
   printf '%s\n' "$TARGET_MODE" > "${MODE_FILE}.new"
   printf '%s\n' "$TARGET_HOST" > "${HOST_FILE}.new"
@@ -392,7 +418,9 @@ fi
 
 # Для предотвращения ложного успеха проверяем TLS с корректным именем/IP,
 # а не просто ответ на 127.0.0.1 с --insecure.
-if ! curl --noproxy '*' -sS --connect-timeout 5 --max-time 10 --resolve "${TARGET_HOST}:${PANEL_PORT}:127.0.0.1" "https://${TARGET_HOST}:${PANEL_PORT}/" -o /dev/null; then
+TLS_CURL_ARGS=()
+if [[ -n "$CA_CERT_FILE" ]]; then TLS_CURL_ARGS=(--cacert "$CA_CERT_FILE"); fi
+if ! curl "${TLS_CURL_ARGS[@]}" --noproxy '*' -sS --connect-timeout 5 --max-time 10 --resolve "${TARGET_HOST}:${PANEL_PORT}:127.0.0.1" "https://${TARGET_HOST}:${PANEL_PORT}/" -o /dev/null; then
   fail "HTTPS на ${TARGET_HOST}:${PANEL_PORT} не прошёл проверку. Проверьте TLS и DNS."
 fi
 log "Готово: https://${TARGET_HOST}:${PANEL_PORT}/"
