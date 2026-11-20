@@ -56,6 +56,9 @@ check_https() {
   log "GUI $host:2053$path возвращает HTTP 200, TLS-сертификат доверенный"
 }
 
+log "Проверка совместимости установленной ОС"
+bash deploy.sh --check-os
+
 log "Запуск настоящего деплоя: Mihomo, m-ui, systemd и TLS"
 run_root bash deploy.sh --ip 8.8.8.8 --cert-file "$TMP/ip-a.pem" \
   --key-file "$TMP/ip-a.key" --ca-cert "$TMP/ca.pem" >"$TMP/install.log" 2>&1 || {
