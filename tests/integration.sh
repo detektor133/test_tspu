@@ -35,6 +35,7 @@ EOF
 make_cert ip-a "IP:8.8.8.8"
 make_cert ip-b "IP:1.1.1.1"
 make_cert panel "DNS:panel.example.test"
+make_cert duck "DNS:example.duckdns.org"
 
 # Тестовый CA делаем доверенным ОС, чтобы повторный запуск проверял HTTPS без особых флагов.
 sudo install -m 0644 "$TMP/ca.pem" /usr/local/share/ca-certificates/test-tspu-ci.crt
@@ -74,6 +75,22 @@ sudo /usr/local/m-ui/m-ui version >/dev/null
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "8.8.8.8"
 assert_eq "$(sudo cat /var/lib/test-tspu/cert-mode)" "custom"
 check_https 8.8.8.8
+
+log "Проверка создания inbounds в панели и прослушивания портов"
+sudo python3 - <<'PY'
+import json
+p = '/usr/local/m-ui/data/state.json'
+with open(p) as f: state = json.load(f)
+names = {x['name'] for x in state['inbounds']}
+required = {'test-tspu-ss', 'test-tspu-hysteria2', 'test-tspu-tuic',
+            'test-tspu-trojan', 'test-tspu-anytls', 'test-tspu-vless-xhttp'}
+assert required <= names, names
+PY
+sudo stat -c %a /var/lib/test-tspu/panel-password | grep -qx 600
+sudo stat -c %a /var/lib/test-tspu/inbound-secrets.json | grep -qx 600
+for port in 8388 9443 10443 11443; do
+  sudo ss -ltn | grep -Eq ":$port[[:space:]]" || { echo "TCP $port не слушает" >&2; exit 1; }
+done
 
 log "Повторный деплой: отсутствие изменений и прежний PID"
 pid_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
@@ -161,6 +178,38 @@ assert_eq "$(sudo cat /var/lib/test-tspu/panel-mode)" "domain"
 check_https panel.example.test
 run_root bash deploy.sh --sync-ip --ip 8.8.8.8 >"$TMP/domain-sync.log"
 grep -q 'Для домена сертификат привязан к имени' "$TMP/domain-sync.log"
+
+log "DuckDNS: запись, смена IP, отсутствие повторных запросов и хранение токена"
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ "$arg" == 'https://www.duckdns.org/update' ]]; then
+    printf 'OK\n'
+    printf 'updated\n' >> "$MOCK_LOG"
+    exit 0
+  fi
+done
+exec /usr/bin/curl "$@"
+MOCK
+chmod 755 "$TMP/bin/curl"
+printf 'test-duckdns-token-%s\n' "$RANDOM" >"$TMP/duckdns-token"
+run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
+  --duckdns example.duckdns.org --duckdns-token-file "$TMP/duckdns-token" --ip 8.8.8.8 \
+  --cert-file "$TMP/duck.pem" --key-file "$TMP/duck.key" --ca-cert "$TMP/ca.pem" \
+  >"$TMP/duckdns-install.log" 2>&1 || { cat "$TMP/duckdns-install.log"; exit 1; }
+assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "example.duckdns.org"
+assert_eq "$(sudo cat /var/lib/test-tspu/duckdns-current-ip)" "8.8.8.8"
+sudo stat -c %a /var/lib/test-tspu/duckdns-token | grep -qx 600
+check_https example.duckdns.org
+run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
+  --sync-ip --ip 1.1.1.1 >"$TMP/duckdns-sync.log" 2>&1 || {
+    cat "$TMP/duckdns-sync.log"; exit 1;
+  }
+assert_eq "$(sudo cat /var/lib/test-tspu/duckdns-current-ip)" "1.1.1.1"
+run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
+  --sync-ip --ip 1.1.1.1 >"$TMP/duckdns-noop.log"
+assert_eq "$(wc -l < "$TMP/duckdns.log")" "2"
 
 log "Проверка отката сетевых настроек"
 run_root bash deploy.sh --rollback-tuning >"$TMP/rollback.log"
