@@ -111,11 +111,11 @@ python3 -m http.server 18180 --bind 127.0.0.1 --directory "$ROOT/origin" \
   > "$ROOT/origin.log" 2>&1 &
 ORIGIN_PID=$!
 
-/usr/local/m-ui/mihomo -d "$ROOT/client-home" -t -f "$ROOT/client.yaml" \
+sudo /usr/local/m-ui/mihomo -d "$ROOT/client-home" -t -f "$ROOT/client.yaml" \
   > "$ROOT/validate.log" 2>&1 ||
     fatal 'невалидная клиентская конфигурация Mihomo'
 
-/usr/local/m-ui/mihomo -d "$ROOT/client-home" -f "$ROOT/client.yaml" \
+sudo /usr/local/m-ui/mihomo -d "$ROOT/client-home" -f "$ROOT/client.yaml" \
   > "$ROOT/client.log" 2>&1 &
 CHILD_PID=$!
 ready=0
