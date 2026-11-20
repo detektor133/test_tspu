@@ -68,11 +68,22 @@ def port_evidence(before, after, expected):
         raise RuntimeError("Нет счётчика для " + expected)
     others = sum(p for key, (p, _) in delta.items() if key != expected)
     packets, ip_bytes = delta[expected]
-    return {"route_status": ("verified" if packets and not others else
-                             "ambiguous" if packets else "no_ingress"),
-            "route_port": expected,
-            "route_packets": packets, "route_ip_bytes": ip_bytes,
-            "unexpected_port_packets": others}
+    # Tail packets from the immediately preceding transport are normal:
+    # a few TCP FIN/ACK or retransmissions do not imply a proxy fallback.
+    # Significant simultaneous activity remains inconclusive.
+    noise_limit = max(8, packets // 20)
+    if not packets:
+        status = "no_ingress"
+    elif others == 0:
+        status = "verified"
+    elif others <= noise_limit:
+        status = "verified_with_noise"
+    else:
+        status = "ambiguous"
+    return {"route_status": status,
+            "route_port": expected, "route_packets": packets,
+            "route_ip_bytes": ip_bytes, "unexpected_port_packets": others,
+            "noise_threshold_packets": noise_limit}
 
 
 

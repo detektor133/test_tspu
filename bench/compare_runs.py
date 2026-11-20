@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from generate_report import chart, ORDER, valid_level, attach_evidence
+from generate_report import chart, ORDER, valid_level, valid_rtt, attach_evidence
 
 
 def rows_in(path):
@@ -34,9 +34,15 @@ def combine(folders, output):
     def index(rows):
         return {(r["protocol"], int(float(r["concurrency"]))): r
                 for r in rows if r.get("protocol") in ORDER
-                and r.get("status") in ("ok", "failed", "budget_limited", "insufficient_samples")
                 and r.get("concurrency")}
     indexed = {net: index(rows) for net, rows in datasets.items()}
+    methodologies = {
+        (m.get("mode"), m.get("seconds_per_level"), m.get("payload_bytes"),
+         m.get("ping_interval_seconds"), tuple(m.get("levels") or []),
+         tuple(m.get("protocols_selected") or []))
+        for m in metadata.values()
+    }
+    compatible = len(methodologies) == 1 and next(iter(methodologies))[0] in ("load", "soak")
     levels = sorted({level for data in indexed.values() for _, level in data})
     header = "| Протокол | Потоки | " + " | ".join(
         net + ": OK/все · МиБ/с · HTTP ping p95, мс" for net in datasets) + " |"
@@ -50,23 +56,22 @@ def combine(folders, output):
                 if not r:
                     columns.append("—")
                     continue
-                if not valid_level(r):
+                if not compatible:
+                    columns.append("методики различаются: сравнение невозможно")
+                elif not valid_level(r):
                     issue = (r.get("status", "неизвестно") if r.get("status") != "ok"
                              else "unverified_legacy")
                     columns.append("%s/%s · не сопоставимо (%s)" %
                                    (r.get("requests_ok", 0), r.get("requests_total", 0), issue))
                 else:
+                    rtt = (str(r.get("app_rtt_p95_ms")) if valid_rtt(r)
+                           else "н/д (HTTP ping n=%s)" % r.get("app_rtt_samples", 0))
                     columns.append("%s/%s · %s · %s" %
                                    (r.get("requests_ok", 0), r.get("requests_total", 0),
-                                    r.get("throughput_mib_s", "—"),
-                                    r.get("app_rtt_p95_ms") or "—"))
+                                    r.get("throughput_mib_s", "—"), rtt))
             table.append("| " + " | ".join(columns) + " |")
     # Для графика выбираем только совместимый уровень параллельности,
     # предпочтительно 8. Отсутствующие успешные измерения не сравниваем.
-    methodologies = {(m.get('seconds_per_level'), m.get('payload_bytes'),
-                      m.get('ping_interval_seconds'), tuple(m.get('levels') or []))
-                     for m in metadata.values()}
-    compatible = len(methodologies) == 1
     shared = set.intersection(*[
         set(level for (protocol, level), r in idx.items() if valid_level(r))
         for idx in indexed.values()
@@ -88,9 +93,11 @@ def combine(folders, output):
     note = (
         "Сети помечены вручную и автоматически не верифицированы. "
         "Разница скорости не доказывает вмешательство ТСПУ. "
-        "В сравнительные цифры и график входят только полные по времени уровни с >=20 "
-        "успешными ответами (статус ok и подтверждённая длительность). "
-        "Старые CSV без метаданных, раннее исчерпание бюджета и малая выборка "
+        "В сравнительные цифры входят только уровни load/soak со статусом ok, "
+        "подтверждённой длительностью, маршрутом и сырыми HTTP-данными. "
+        "HTTP-ping p95 показывается только при >=20 удачных пробах; валидная "
+        "скорость остаётся доступной и без p95. "
+        "Старые CSV без метаданных, раннее исчерпание бюджета и неполная нагрузка "
         "показаны как несопоставимые. Для графика требуется одинаковая длительность "
         "и размер ответа, набор ступеней и частота HTTP ping. "
         "Мобильный сигнал, маршрут и часы испытаний могли отличаться."
