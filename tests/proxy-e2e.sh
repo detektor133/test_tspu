@@ -88,7 +88,9 @@ for x in proxies:
     if 'reality-opts' not in x:
         if x.get('type') in {'hysteria2','tuic','anytls'}:
             x['sni']=host
-        if x.get('type') in {'trojan','vless'}:
+        if x.get('type') == 'trojan':
+            x['sni']=host
+        if x.get('type') == 'vless':
             x['servername']=host
     # REALITY оставляет внешний проверенный SNI, UUID и public key без изменений.
 config['mixed-port']=17891
