@@ -25,7 +25,7 @@ try:
 except ImportError:
     raise SystemExit("Нет PyYAML. В Termux установите: python -m pip install pyyaml")
 
-from http_benchmark import HEADERS, run_level
+from http_benchmark import HEADERS, run_level, request_once
 from generate_report import generate
 
 ROOT = Path(__file__).resolve().parent
@@ -37,7 +37,48 @@ PORTS = [
     (14443, "Hysteria2"), (8443, "TUIC"), (8388, "Shadowsocks"),
     (9443, "Trojan"), (10443, "AnyTLS"),
 ]
-CSV_FIELDS = ["network", "protocol", "proxy_name", "status", "error"] + HEADERS
+CSV_FIELDS = ["network", "protocol", "proxy_name", "status", "error",
+              "route_status", "route_port", "route_packets", "route_ip_bytes",
+              "unexpected_port_packets", "cumulative_mib"] + HEADERS
+SAMPLE_FIELDS = ["network", "protocol", "concurrency", "started_utc", "ended_utc",
+                 "ok", "bytes_ok", "ttfb_ms", "latency_ms", "error_type", "nonce"]
+TRANSPORT = {"VLESS REALITY": "tcp", "VLESS XHTTP": "tcp",
+             "Hysteria2": "udp", "TUIC": "udp", "Shadowsocks": "tcp",
+             "Trojan": "tcp", "AnyTLS": "tcp"}
+TYPES = {"VLESS REALITY": "vless", "VLESS XHTTP": "vless",
+         "Hysteria2": "hysteria2", "TUIC": "tuic",
+         "Shadowsocks": "ss", "Trojan": "trojan", "AnyTLS": "anytls"}
+
+
+def port_evidence(before, after, expected):
+    """Independent ingress observation; fail closed when counters go backwards."""
+    if not (before.get("available") and after.get("available")):
+        raise RuntimeError("Счётчик пакетов VPS недоступен")
+    a, b = before.get("counters", {}), after.get("counters", {})
+    delta = {}
+    for port in b:
+        x, y = a.get(port, {}), b[port]
+        p = int(y.get("packets", 0)) - int(x.get("packets", 0))
+        z = int(y.get("ip_bytes", 0)) - int(x.get("ip_bytes", 0))
+        if p < 0 or z < 0:
+            raise RuntimeError("Счётчики VPS сбросились во время теста")
+        delta[port] = (p, z)
+    if expected not in delta:
+        raise RuntimeError("Нет счётчика для " + expected)
+    others = sum(p for key, (p, _) in delta.items() if key != expected)
+    packets, ip_bytes = delta[expected]
+    return {"route_status": ("verified" if packets and not others else
+                             "ambiguous" if packets else "no_ingress"),
+            "route_port": expected,
+            "route_packets": packets, "route_ip_bytes": ip_bytes,
+            "unexpected_port_packets": others}
+
+
+def vps_counters(dest, port, remote):
+    response = run_ssh(dest, port, "python3 " + remote
+                       + "/vps_session.py counters --dir " + remote)
+    return json.loads(response)
+
 
 
 def now():
@@ -130,8 +171,8 @@ def run(a):
         raise SystemExit("Нет Android Mihomo. Запустите bash bench/setup_termux.sh")
     if a.ssh_port < 1 or a.ssh_port > 65535 or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", a.ssh_user):
         raise SystemExit("Некорректные SSH-параметры")
-    if not (3 <= a.seconds <= 120 and 8 <= a.max_mib <= 1024):
-        raise SystemExit("--seconds 3..120, --max-mib 8..1024")
+    if not (3 <= a.seconds <= 120 and 8 <= a.max_mib <= 4096):
+        raise SystemExit("--seconds 3..120, --max-mib 8..4096")
     try:
         levels = [int(v.strip()) for v in a.levels.split(",")]
     except ValueError:
@@ -150,6 +191,9 @@ def run(a):
             continue
         for port, label in PORTS:
             if node.get("port") == port and label not in nodes:
+                if node.get("type") != TYPES[label]:
+                    raise SystemExit("Профиль на порту %d имеет тип %r вместо %s"
+                                     % (port, node.get("type"), TYPES[label]))
                 nodes[label] = node
     if not nodes:
         raise SystemExit("В подписке нет профилей для указанного VPS")
@@ -177,11 +221,17 @@ def run(a):
     home = output / ".mihomo-home"
     home.mkdir(mode=0o700)
     ctrl_secret = secrets.token_hex(24)
+    broken = "__TEST_BROKEN_SOCKS5__"
+    if broken in names:
+        raise SystemExit("Имя тестового неработающего профиля занято")
     cfg = {"mixed-port": 17890, "allow-lan": False, "mode": "rule",
            "external-controller": "127.0.0.1:19090", "secret": ctrl_secret,
-           "log-level": "error", "proxies": list(nodes.values()),
+           "log-level": "error",
+           "proxies": list(nodes.values()) + [{"name": broken, "type": "socks5",
+                                                "server": "127.0.0.1", "port": 1}],
            "proxy-groups": [{"name": "FIELD", "type": "select",
-                             "proxies": names}], "rules": ["MATCH,FIELD"]}
+                             "proxies": names + ["DIRECT", broken]}],
+           "rules": ["MATCH,FIELD"]}
     conf = output / "private-mihomo.yaml"
     conf.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
     conf.chmod(0o600)
@@ -201,20 +251,24 @@ def run(a):
     started_session = False
     process = None
     rows = []
+    samples = []
+    controls = {"DIRECT": "not_run", "BROKEN_SOCKS5": "not_run"}
     remote_error = ""
     budget = int(a.max_mib * 1024 * 1024 // 262144)
     future_levels = [level for _, label in PORTS if label in nodes for level in levels]
     started_at = now()
     try:
         run_ssh(dest, a.ssh_port, "mkdir -m 700 -p " + remote)
-        for name in ("origin.py", "server_monitor.py", "vps_session.py"):
+        for name in ("origin.py", "server_monitor.py", "port_capture.py", "vps_session.py"):
             remote_scp(a.ssh_port, ROOT / name, dest + ":" + remote + "/" + name)
         response = run_ssh(dest, a.ssh_port,
                            "python3 " + remote + "/vps_session.py start --dir " + remote
-                           + " --duration " + str(secs) + " --size 262144", timeout=30)
+                           + " --duration " + str(secs) + " --size 262144 --capture", timeout=30)
         info = json.loads(response)
         started_session = True
         expected = info["sha256"]
+        if not info.get("capture"):
+            raise RuntimeError("VPS не подтвердил независимый сбор пакетов")
         logfile = (output / "mihomo.log").open("w")
         try:
             process = subprocess.Popen(cmd, stdout=logfile, stderr=subprocess.STDOUT)
