@@ -41,7 +41,8 @@ PORTS = [
 CSV_FIELDS = ["network", "protocol", "proxy_name", "status", "error",
               "route_status", "route_port", "route_packets", "route_ip_bytes",
               "unexpected_port_packets", "cumulative_mib", "protocol_cumulative_mib"] + HEADERS
-SAMPLE_FIELDS = ["network", "protocol", "concurrency", "started_utc", "ended_utc",
+SAMPLE_FIELDS = ["network", "protocol", "concurrency", "kind",
+                 "started_utc", "ended_utc",
                  "ok", "bytes_ok", "ttfb_ms", "latency_ms", "error_type", "nonce"]
 TRANSPORT = {"VLESS REALITY": "tcp", "VLESS XHTTP": "tcp",
              "Hysteria2": "udp", "TUIC": "udp", "Shadowsocks": "tcp",
@@ -263,6 +264,7 @@ def run(a):
             raise RuntimeError("Локальный API Mihomo не отвечает")
         from urllib.parse import urlsplit
         target = urlsplit("http://127.0.0.1:18180/payload")
+        ping_target = urlsplit("http://127.0.0.1:18180/ping")
         proxy = urlsplit("http://127.0.0.1:17890")
         # NEGATIVE CONTROLS: a direct call and a definitely broken outbound
         # MUST NOT download the origin. This catches bypasses/fallbacks.
@@ -313,7 +315,9 @@ def run(a):
                 measurement = run_level(
                     target, proxy, level, a.seconds, a.timeout,
                     262144, expected, 262144, max_requests=quota,
-                    on_sample=level_samples.append, verify_nonce=True)
+                    on_sample=lambda r: level_samples.append({"kind": "download", **r}),
+                    on_ping_sample=lambda r: level_samples.append({"kind": "ping", **r}),
+                    ping_target=ping_target, ping_interval=1.0, verify_nonce=True)
                 t1 = now()
                 # Packet recorder flushes counters periodically (200 ms).
                 time.sleep(.3)
@@ -333,6 +337,8 @@ def run(a):
                     quality = "budget_limited"
                 elif measurement["latency_samples"] < 20:
                     quality = "insufficient_samples"
+                elif measurement["app_rtt_samples"] < 20:
+                    quality = "insufficient_rtt_samples"
                 else:
                     quality = "ok"
                 row = {"network": a.network, "protocol": label,
@@ -346,11 +352,14 @@ def run(a):
                 rows.append(row)
                 p95 = ("%.0f мс" % row["latency_p95_ms"]
                        if row["latency_p95_ms"] != "" else "н/д (<20 успешных ответов)")
+                app95 = (str(row["app_rtt_p95_ms"]) + " мс"
+                         if row["app_rtt_p95_ms"] != "" else "н/д (<20 ping)")
                 print("%s | %2d потоков | %d/%d OK | %.2f МиБ/с | %.2f/%.2f с | %s | "
-                      "порт %s: %d входящих пакетов | p95 %s" %
+                      "порт %s: %d пакетов | ping p95 %s | загрузка p95 %s" %
                       (label, level, row["requests_ok"], row["requests_total"],
                        row["throughput_mib_s"], row["seconds_elapsed"], a.seconds,
-                       quality, route["route_port"], route["route_packets"], p95), flush=True)
+                       quality, route["route_port"], route["route_packets"], app95, p95),
+                      flush=True)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
         remote_error = "%s: %s" % (type(exc).__name__, str(exc)[:180])
         print("Ошибка теста: " + remote_error, file=sys.stderr)
@@ -386,7 +395,8 @@ def run(a):
                     "protocols_expected": [label for _, label in PORTS],
                     "profiles_found": len(nodes), "levels": levels,
                     "seconds_per_level": a.seconds, "max_mib": a.max_mib,
-                    "payload_bytes": 262144, "min_p95_samples": 20,
+                    "payload_bytes": 262144, "ping_interval_seconds": 1,
+                    "min_p95_samples": 20,
                     "min_p99_samples": 100,
                     "route_evidence": "VPS AF_PACKET ingress ports",
                     "negative_controls": controls,
