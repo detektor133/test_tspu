@@ -64,6 +64,7 @@ usage() {
 --ca-cert ФАЙЛ       : доверенный CA для проверки HTTPS (включая CI).
 --sync-ip            : проверить смену IP и перевыпустить IP-сертификат при необходимости.
 --check              : показать состояние без изменений.
+--show-access         : показать полный URL, логин и пароль в локальном терминале root (без установки).
 --check-os           : проверить совместимость ОС, пакетного менеджера и systemd без установки.
 --rollback-tuning    : отменить сетевые оптимизации.
 --firewall --ssh-port ПОРТ : осторожно включить UFW, сохранив указанный SSH-порт.
@@ -89,6 +90,7 @@ while (($#)); do
     --firewall) FIREWALL=1; shift ;;
     --ssh-port) (($# >= 2)) || fail 'укажите номер порта'; SSH_PORT="$2"; shift 2 ;;
     --check) MODE='check'; shift ;;
+    --show-access) MODE='show-access'; shift ;;
     --check-os) MODE='check-os'; shift ;;
     --rollback-tuning) MODE='rollback'; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -299,6 +301,40 @@ sync_ip() {
 
 require_root() { ((EUID == 0)) || fail 'запустите от root: sudo bash deploy.sh'; }
 
+# Секреты остаются в файлах root-only; в CI и перенаправленных логах их НЕ выводим.
+# m-ui хранит случайный путь панели в state.json (а не только адрес https://IP:2053/).
+show_access() {
+  require_root
+  [[ -s "$HOST_FILE" && -s "$PANEL_USER_FILE" && -s "$PANEL_PASS_FILE" &&
+     -r /usr/local/m-ui/data/state.json ]] ||
+    fail 'данные доступа не найдены: установка ещё не завершена; проверьте /var/lib/test-tspu'
+  if [[ ! -t 1 ]]; then
+    log 'Данные панели сохранены в защищённых файлах (0600); пароль не выводится в логи.'
+    log 'Для показа URL, логина и пароля выполните в SSH-терминале: sudo /usr/local/sbin/test-tspu-deploy --show-access'
+    return 0
+  fi
+  local panel_path panel_host
+  panel_path="$(python3 - <<'PY'
+import json
+from pathlib import Path
+settings = json.loads(Path('/usr/local/m-ui/data/state.json').read_text())['settings']
+path = (settings.get('panelPath') or '').strip('/')
+if not path or '/' in path:
+    raise SystemExit('Не найден корректный путь панели m-ui в state.json')
+print(path)
+PY
+)" || fail 'не удалось определить защищённый путь панели m-ui'
+  panel_host="$(cat "$HOST_FILE")"
+  printf '\n=== Доступ к m-ui (не публикуйте этот вывод!) ===\n'
+  printf 'Панель: https://%s:%s/%s/\n' "$panel_host" "$PANEL_PORT" "$panel_path"
+  printf 'Логин: %s\n' "$(cat "$PANEL_USER_FILE")"
+  printf 'Пароль: %s\n' "$(cat "$PANEL_PASS_FILE")"
+  printf 'Протоколы и клиенты: внутри m-ui (раздел Inbounds)\n'
+  printf 'Ссылки и QR: sudo cat %s/subscriptions.txt\n' "$DATA_DIR"
+  printf '============================================\n\n'
+}
+
+
 status() {
   log "Ядро Linux: $(uname -r)"
   if [[ -r "$MODE_FILE" && -r "$HOST_FILE" ]]; then log "Адрес панели: https://$(cat "$HOST_FILE"):2053/ ($(cat "$MODE_FILE"))"; fi
@@ -377,6 +413,7 @@ verify_platform() {
   log "Совместимая платформа: ${PRETTY_NAME:-$id $version} (APT + systemd)"
 }
 
+if [[ "$MODE" == show-access ]]; then show_access; exit 0; fi
 if [[ "$MODE" == check-os ]]; then verify_platform; exit 0; fi
 if [[ "$MODE" == check ]]; then status; exit 0; fi
 if [[ "$MODE" == rollback ]]; then rollback; exit 0; fi
@@ -1179,14 +1216,14 @@ if [[ -n "$CA_CERT_FILE" ]]; then TLS_CURL_ARGS=(--cacert "$CA_CERT_FILE"); fi
 if ! curl "${TLS_CURL_ARGS[@]}" --noproxy '*' -sS --retry 6 --retry-connrefused --retry-delay 1 --connect-timeout 3 --max-time 3 --resolve "${TARGET_HOST}:${PANEL_PORT}:127.0.0.1" "https://${TARGET_HOST}:${PANEL_PORT}/" -o /dev/null; then
   fail "HTTPS на ${TARGET_HOST}:${PANEL_PORT} не прошёл проверку. Проверьте TLS и DNS."
 fi
-log "Готово: https://${TARGET_HOST}:${PANEL_PORT}/"
-log 'Путь, логин и пароль выведены установщиком m-ui. Сохраните их.'
-log 'Откройте во внешнем firewall TCP 80 (сертификаты) и TCP 2053 (GUI).'
+log 'Установлено: m-ui v0.3.3, Mihomo v1.19.34, HTTPS и службы systemd.'
+log 'Подключения: VLESS REALITY, VLESS XHTTP, Hysteria2, TUIC, Shadowsocks, Trojan, AnyTLS.'
+log 'Откройте во внешнем firewall TCP 80 (сертификаты), TCP 2053 (GUI) и порты протоколов.'
 log 'Для изменения IP можно повторить установку с --ip АДРЕС или дождаться проверки по таймеру.'
-log 'Клиентские подключения и их порты создаются отдельно в GUI.'
 if ((CHANGED == 0)); then
   log 'Итог: без изменений, работающие службы не перезапускались'
 else
   log "Итог: применено изменений: $CHANGED"
 fi
 status
+show_access
