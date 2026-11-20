@@ -3,6 +3,8 @@
 import argparse
 import hashlib
 import os
+import re
+from urllib.parse import urlsplit, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -18,14 +20,21 @@ def main():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.split('?', 1)[0] != '/payload':
+            parsed = urlsplit(self.path)
+            if parsed.path != '/payload':
                 self.send_error(404)
+                return
+            nonce = parse_qs(parsed.query).get('nonce', [''])[0]
+            if nonce and not re.fullmatch(r'[a-f0-9]{24}', nonce):
+                self.send_error(400)
                 return
             self.send_response(200)
             self.send_header('Content-Type', 'application/octet-stream')
             self.send_header('Content-Length', str(len(payload)))
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-SHA256', checksum)
+            if nonce:
+                self.send_header('X-Test-Nonce', nonce)
             self.end_headers()
             try:
                 self.wfile.write(payload)
