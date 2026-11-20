@@ -24,6 +24,7 @@ HEADERS = [
     'requests_total', 'requests_ok', 'requests_failed', 'success_rate_pct',
     'bytes_ok', 'throughput_mib_s', 'ttfb_p50_ms', 'ttfb_p95_ms',
     'latency_p50_ms', 'latency_p95_ms', 'latency_p99_ms',
+    'measurement_status', 'duration_coverage_pct', 'latency_samples',
 ]
 
 
@@ -33,6 +34,15 @@ def percentile(samples, q):
         return 0.0
     ordered = sorted(samples)
     return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+
+MIN_P95_SAMPLES = 20
+MIN_P99_SAMPLES = 100
+
+
+def percentile_or_missing(samples, q, minimum):
+    """A percentile from too few completed responses is not a defensible estimate."""
+    return round(percentile(samples, q), 2) if len(samples) >= minimum else ""
 
 
 def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes):
@@ -100,13 +110,17 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
     started = time.monotonic()
     deadline = started + seconds
     reserved = 0
+    budget_limited = False
 
     def worker():
-        nonlocal reserved
+        nonlocal reserved, budget_limited
         batch = []
         while time.monotonic() < deadline:
             with lock:
                 if max_requests is not None and reserved >= max_requests:
+                    # Do not call a quota-truncated run a full-duration load test.
+                    if time.monotonic() < deadline:
+                        budget_limited = True
                     break
                 reserved += 1
             batch.append(request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes))
@@ -119,6 +133,8 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
             task.result()
     wall = time.monotonic() - started
     ok = [r for r in completed if r[0]]
+    first_byte = [r[2] for r in ok]
+    full_latency = [r[3] for r in ok]
     return {
         'seconds_elapsed': round(wall, 3),
         'requests_total': len(completed),
@@ -127,11 +143,14 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
         'success_rate_pct': round(len(ok) / len(completed) * 100, 2) if completed else 0,
         'bytes_ok': sum(r[1] for r in ok),
         'throughput_mib_s': round(sum(r[1] for r in ok) / (1024 ** 2 * wall), 3) if wall else 0,
-        'ttfb_p50_ms': round(percentile([r[2] for r in ok], .5), 2),
-        'ttfb_p95_ms': round(percentile([r[2] for r in ok], .95), 2),
-        'latency_p50_ms': round(percentile([r[3] for r in ok], .5), 2),
-        'latency_p95_ms': round(percentile([r[3] for r in ok], .95), 2),
-        'latency_p99_ms': round(percentile([r[3] for r in ok], .99), 2),
+        'ttfb_p50_ms': round(percentile(first_byte, .5), 2) if ok else '',
+        'ttfb_p95_ms': percentile_or_missing(first_byte, .95, MIN_P95_SAMPLES),
+        'latency_p50_ms': round(percentile(full_latency, .5), 2) if ok else '',
+        'latency_p95_ms': percentile_or_missing(full_latency, .95, MIN_P95_SAMPLES),
+        'latency_p99_ms': percentile_or_missing(full_latency, .99, MIN_P99_SAMPLES),
+        'measurement_status': 'budget_limited' if budget_limited else 'time_completed',
+        'duration_coverage_pct': round(min(100.0, wall / seconds * 100), 1),
+        'latency_samples': len(ok),
     }
 
 
@@ -186,10 +205,13 @@ def main():
             **measurement,
         }
         results.append(row)
+        p95_ttfb = str(row['ttfb_p95_ms']) if row['ttfb_p95_ms'] != '' else 'н/д (мало выборок)'
+        p95_full = str(row['latency_p95_ms']) if row['latency_p95_ms'] != '' else 'н/д (мало выборок)'
         print(f"{args.label}: {level:>3} потоков | {row['requests_ok']}/{row['requests_total']} OK | "
-              f"{row['throughput_mib_s']:.3f} МиБ/с | p95 первого байта "
-              f"{row['ttfb_p95_ms']:.2f} мс | p95 полного ответа "
-              f"{row['latency_p95_ms']:.2f} мс", flush=True)
+              f"{row['throughput_mib_s']:.3f} МиБ/с | "
+              f"{row['seconds_elapsed']:.2f}/{args.seconds:.2f} с "
+              f"[{row['measurement_status']}] | p95 TTFB {p95_ttfb} мс | "
+              f"p95 полного ответа {p95_full} мс", flush=True)
     # Не сохраняем URL, токены и содержимое HTTP-ответов.
     with args.output.open('w', newline='', encoding='utf-8') as fp:
         writer = csv.DictWriter(fp, fieldnames=HEADERS)

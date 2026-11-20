@@ -26,6 +26,28 @@ def num(value):
         return 0.0
 
 
+def valid_level(row):
+    """A full timed observation with enough responses for a p95 estimate.
+
+    Legacy CSVs without timing/sample metadata must not masquerade as validated.
+    """
+    try:
+        return (row.get("status") == "ok"
+                and row.get("measurement_status") == "time_completed"
+                and float(row.get("seconds_configured") or 0) > 0
+                and float(row.get("seconds_elapsed") or 0) >= float(row["seconds_configured"]) - .01
+                and int(float(row.get("latency_samples") or 0)) >= 20
+                and int(float(row.get("requests_ok") or 0)) >= 20)
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+def metric(value, precision=1):
+    if value is None or value == '':
+        return '—'
+    return cell(num(value), precision)
+
+
 def when(value):
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -92,39 +114,43 @@ def generate(folder):
     by_label = {}
     for label in ORDER:
         group = [r for r in rows if r.get("protocol") == label]
-        tested = [r for r in group if r.get("status") in ("ok", "failed")]
+        tested = [r for r in group if r.get("status") in ("ok", "failed", "budget_limited", "insufficient_samples")]
         by_label[label] = tested
         if not tested:
             reason = group[0].get("status", "не измерялся") if group else "не измерялся"
-            reported.append("| %s | — | — | — | — | — | — | %s |" % (label, reason))
+            reported.append("| %s | — | — | — | — | — | — | — | %s |" % (label, reason))
             continue
         for r in tested:
             res = resources_for(r, resources)
-            reported.append("| %s | %s | %s/%s | %s | %s | %s | %s | %s |" %
+            reported.append("| %s | %s | %s/%s | %s/%s | %s | %s | %s | %s | %s |" %
                             (label, r.get("concurrency", "—"), r.get("requests_ok", "0"),
                              r.get("requests_total", "0"),
-                             cell(num(r.get("throughput_mib_s")), 3),
-                             cell(num(r.get("latency_p95_ms"))),
+                             metric(r.get("seconds_elapsed"), 2), metric(r.get("seconds_configured"), 2),
+                             metric(r.get("throughput_mib_s"), 3),
+                             metric(r.get("latency_p95_ms")),
                              cell(res["cpu_peak"] if res else None),
                              cell(res["rss_peak"] if res else None),
-                             r.get("status", "?")))
+                             (r.get("status", "?") if r.get("status") != "ok" or valid_level(r)
+                              else "unverified_legacy")))
     totals = {label: sum(int(num(r.get("requests_total"))) for r in group)
               for label, group in by_label.items()}
     successful = {label: sum(int(num(r.get("requests_ok"))) for r in group)
                   for label, group in by_label.items()}
     transferred = {label: sum(int(num(r.get("bytes_ok"))) for r in group)
                    for label, group in by_label.items()}
-    good = [x for label in ORDER for x in by_label[label] if x.get("status") == "ok"]
-    throughput = [(label, max((num(r.get("throughput_mib_s")) for r in by_label[label]), default=0.0))
+    good = [x for label in ORDER for x in by_label[label] if valid_level(x)]
+    quality_issues = [x for label in ORDER for x in by_label[label] if not valid_level(x)]
+    throughput = [(label, max((num(r.get("throughput_mib_s")) for r in by_label[label]
+                               if valid_level(r)), default=0.0))
                   for label in ORDER]
     latency = [(label, min((num(r.get("latency_p95_ms")) for r in by_label[label]
-                            if r.get("status") == "ok"), default=0.0))
+                            if valid_level(r) and r.get("latency_p95_ms") not in ('', None)), default=0.0))
                for label in ORDER]
     # Zero on a chart means "no successful observation" rather than a measured 0 ms.
     charts = folder / "charts"
     charts.mkdir(exist_ok=True)
-    chart(charts / "throughput.svg", "Максимальная наблюдаемая скорость по уровням", throughput, "МиБ/с")
-    chart(charts / "latency.svg", "Минимальная наблюдаемая p95 по уровням (0 = нет данных)", latency, "мс")
+    chart(charts / "throughput.svg", "Скорость: только полные интервалы и достаточно выборок", throughput, "МиБ/с")
+    chart(charts / "latency.svg", "p95: только полные интервалы (0 = нет данных)", latency, "мс")
     total_bytes = sum(transferred.values())
     all_requests = sum(totals.values())
     all_ok = sum(successful.values())
@@ -134,6 +160,11 @@ def generate(folder):
         notes.append("Измерений нет: скрипт не успел создать ни одного результата.")
     if absent:
         notes.append("Не измерены или недоступны профили: " + ", ".join(absent) + ".")
+    if quality_issues:
+        notes.append("Часть уровней имеет статус budget_limited, insufficient_samples, failed "
+                     "или unverified_legacy (старый CSV без метаданных): "
+                     "это проверка передачи данных, но не подтверждённый бенчмарк заданной длительности. "
+                     "Они исключены из графиков сравнимой скорости/задержки.")
     if not resources:
         notes.append("CPU/RAM на VPS отсутствуют: SSH-монитор не передал CSV.")
     elif good and not any(resources_for(r, resources) for r in good):
@@ -144,6 +175,10 @@ def generate(folder):
         "Тип доступа к сети указал пользователь; скрипт не доказывает, что Android реально использовал именно эту сеть.",
         "Проверен трафик через туннель к loopback-HTTP на собственном VPS; это не скорость стороннего сайта.",
         "TTFB и полное время ответа не равны сетевому RTT. Отдельный RTT не измерялся.",
+        "budget_limited: бюджет кончился раньше таймера; скорость за фактический интервал "
+        "не является устойчивой скоростью за заданные секунды.",
+        "insufficient_samples: до конца таймера дошли, но получено меньше 20 успешных ответов; "
+        "для p95 требуется >=20, для p99 >=100. Недостаточные процентили показаны как «—».",
         "Использование Mihomo и на сервере, и на клиенте ограничивает переносимость результатов на иные реализации.",
         "Один тайм-аут или падение скорости не доказывает вмешательство ТСПУ. Для таких выводов нужны повторные испытания и контрольные сети.",
         "Байты учитываются для успешных HTTP-ответов; ошибочные подключения и заголовки дают дополнительный неучтённый трафик.",
@@ -154,7 +189,11 @@ def generate(folder):
                         for label in ORDER)
     details = "\n".join(reported)
     limits = "\n".join("- " + note for note in notes)
-    status = "Полный прогон" if len(good) == len([r for r in rows if r.get("status") in ("ok", "failed")]) and not absent and not meta.get("error") else "Неполный прогон"
+    expected_levels = len(ORDER) * len(meta.get("levels", []))
+    complete = (bool(expected_levels) and len(good) == expected_levels
+                and not absent and not meta.get("error")
+                and bool(resources) and all(resources_for(r, resources) is not None for r in good))
+    status = "Полноценный бенчмарк" if complete else "Пробный/неполный прогон"
     document = """# Автоматический отчёт о полевом тестировании AnyModel
 
 **Статус:** {status}.
@@ -167,7 +206,7 @@ def generate(folder):
 - Клиент: Android/Termux, {client}
 - Полезная нагрузка одного запроса: {size} байт
 - Уровни параллельных HTTP-запросов: {levels}
-- Плановое время одного уровня: {seconds} с
+- Плановое время одного уровня: {seconds} с (фактическое время для каждого уровня — в таблице)
 - Верхняя граница отправленных ответов: {budget} МиБ (считая полный ответ даже при ошибке проверки)
 - Успешных запросов за весь тест: {ok}/{count}
 - Подтверждённый объём успешных HTTP-ответов: {mib:.2f} МиБ
@@ -182,16 +221,16 @@ def generate(folder):
 |---|---:|---:|
 {summary}
 
-| Протокол | Потоки | OK/все | МиБ/с | p95 полного ответа, мс | CPU Mihomo peak, % ядра | RSS peak, МиБ | Статус |
-|---|---:|---:|---:|---:|---:|---:|---|
+| Протокол | Потоки | OK/все | Факт/план, с | МиБ/с | p95 полного ответа, мс | CPU Mihomo peak, % ядра | RSS peak, МиБ | Статус |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
 {details}
 
 100% CPU = одно занятое логическое ядро; это не процент всех ядер VPS.
-Строки без успешных запросов не дают достоверного p95; их нулевые значения скорости/задержки следует читать как отсутствие успешного измерения, а не как нулевую реальную задержку.
+Статус `ok` означает, что плановая длительность выдержана и есть >=20 успешных ответов. `budget_limited` означает завершение из-за лимита до таймера; `insufficient_samples` — слишком мало успешных ответов. Строки с этими статусами полезны как функциональная проверка, но НЕ сопоставимы как полноценный нагрузочный тест. p95 доступен только при >=20 успешных ответах, p99 — при >=100. Недоступные метрики указаны «—», а не нулём.
 
-![Скорость](charts/throughput.svg)
+![Скорость (только подтверждённые полные интервалы)](charts/throughput.svg)
 
-![Задержка](charts/latency.svg)
+![Задержка (только подтверждённые полные интервалы)](charts/latency.svg)
 
 CSV с первичными данными: measurements.csv, server-resources.csv.
 В каждом уровне имеются started_utc/ended_utc для привязки метрик VPS.

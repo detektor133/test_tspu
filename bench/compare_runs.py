@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from generate_report import chart, ORDER
+from generate_report import chart, ORDER, valid_level
 
 
 def rows_in(path):
@@ -33,7 +33,8 @@ def combine(folders, output):
     def index(rows):
         return {(r["protocol"], int(float(r["concurrency"]))): r
                 for r in rows if r.get("protocol") in ORDER
-                and r.get("status") in ("ok", "failed") and r.get("concurrency")}
+                and r.get("status") in ("ok", "failed", "budget_limited", "insufficient_samples")
+                and r.get("concurrency")}
     indexed = {net: index(rows) for net, rows in datasets.items()}
     levels = sorted({level for data in indexed.values() for _, level in data})
     header = "| Протокол | Потоки | " + " | ".join(
@@ -48,33 +49,48 @@ def combine(folders, output):
                 if not r:
                     columns.append("—")
                     continue
-                columns.append("%s/%s · %s · %s" %
-                               (r.get("requests_ok", 0), r.get("requests_total", 0),
-                                r.get("throughput_mib_s", "—"),
-                                r.get("latency_p95_ms", "—")
-                                if r.get("status") == "ok" else "нет успешных ответов"))
+                if not valid_level(r):
+                    issue = (r.get("status", "неизвестно") if r.get("status") != "ok"
+                             else "unverified_legacy")
+                    columns.append("%s/%s · не сопоставимо (%s)" %
+                                   (r.get("requests_ok", 0), r.get("requests_total", 0), issue))
+                else:
+                    columns.append("%s/%s · %s · %s" %
+                                   (r.get("requests_ok", 0), r.get("requests_total", 0),
+                                    r.get("throughput_mib_s", "—"),
+                                    r.get("latency_p95_ms") or "—"))
             table.append("| " + " | ".join(columns) + " |")
     # Для графика выбираем только совместимый уровень параллельности,
     # предпочтительно 8. Отсутствующие успешные измерения не сравниваем.
+    methodologies = {(m.get('seconds_per_level'), m.get('payload_bytes'))
+                     for m in metadata.values()}
+    compatible = len(methodologies) == 1
     shared = set.intersection(*[
-        set(level for _, level in idx) for idx in indexed.values()
+        set(level for (protocol, level), r in idx.items() if valid_level(r))
+        for idx in indexed.values()
     ]) if indexed else set()
-    chosen = 8 if 8 in shared else (min(shared) if shared else None)
+    chosen = (8 if 8 in shared else (min(shared) if shared else None)) if compatible else None
     plot = []
     if chosen is not None:
         for protocol in ORDER:
+            # Never chart an unpaired protocol as an apparent network comparison.
+            if not all(valid_level(indexed[net].get((protocol, chosen), {}))
+                       for net in datasets):
+                continue
             for net in datasets:
-                r = indexed[net].get((protocol, chosen))
-                if r and r.get("status") == "ok":
-                    plot.append((protocol + " · " + net,
-                                 float(r.get("throughput_mib_s") or 0)))
+                r = indexed[net][(protocol, chosen)]
+                plot.append((protocol + " · " + net,
+                             float(r.get("throughput_mib_s") or 0)))
     output = Path(output).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     note = (
         "Сети помечены вручную и автоматически не верифицированы. "
         "Разница скорости не доказывает вмешательство ТСПУ. "
-        "Сравнение выполнялось при одинаковом числе потоков, "
-        "но мобильный сигнал, маршрут и часы испытаний могли отличаться."
+        "В сравнительные цифры и график входят только полные по времени уровни с >=20 "
+        "успешными ответами (статус ok и подтверждённая длительность). "
+        "Старые CSV без метаданных, раннее исчерпание бюджета и малая выборка "
+        "показаны как несопоставимые. Для графика требуется одинаковая длительность "
+        "и размер ответа. Мобильный сигнал, маршрут и часы испытаний могли отличаться."
     )
     entries = "\n".join(
         "- %s: UTC %s; телефон %s; ошибки запуска: %s" %
