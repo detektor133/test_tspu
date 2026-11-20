@@ -13,44 +13,135 @@ INSTALLER_URL='https://raw.githubusercontent.com/RomanovCaesar/m-ui/v0.3.3/insta
 FIREWALL=0
 SSH_PORT=''
 MODE='install'
-PUBLIC_PANEL_HOST=''
+DOMAIN=''
+IP_OVERRIDE=''
+SELF_PATH='/usr/local/sbin/test-tspu-deploy'
+INSTALLER_CACHE="${DATA_DIR}/m-ui-upstream-install.sh"
+HOST_FILE="${DATA_DIR}/panel-host"
+MODE_FILE="${DATA_DIR}/panel-mode"
 
 fail() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 log() { printf '[test-tspu] %s\n' "$*"; }
 
 usage() {
   cat <<'HELP'
-Запуск: sudo bash deploy.sh [--public-panel ДОМЕН_ИЛИ_IP] [--firewall --ssh-port ПОРТ] [--check | --rollback-tuning]
+Установка: sudo bash deploy.sh [--domain example.com | --ip A.B.C.D]
+Без аргументов используется автоматически обнаруженный публичный IPv4.
 
-Без параметров: установить Mihomo + m-ui на Ubuntu и включить умеренные сетевые настройки.
-GUI по умолчанию доступен только локально (127.0.0.1:2053), через SSH-туннель.
---public-panel ДОМЕН_ИЛИ_IP : открыть GUI в интернете по HTTPS (на новом сервере).
-    Нужен доступный домен или публичный IPv4 и возможность выпустить TLS-сертификат.
---firewall               : включить UFW только с явным --ssh-port.
---ssh-port ПОРТ          : действующий порт SSH на сервере.
---check                 : показать состояние, ничего не менять.
---rollback-tuning       : откатить только сетевые настройки и лимиты.
+--domain ИМЯ         : панель по домену; запись A должна указывать на VPS.
+--ip АДРЕС           : явно задать публичный IPv4 вместо автоопределения.
+--sync-ip            : проверить смену IP и перевыпустить IP-сертификат при необходимости.
+--check              : показать состояние без изменений.
+--rollback-tuning    : отменить сетевые оптимизации.
+--firewall --ssh-port ПОРТ : осторожно включить UFW, сохранив указанный SSH-порт.
+
+Панель: HTTPS на TCP 2053; для выпуска сертификата нужен доступ снаружи на TCP 80.
+Автопродление: acme.sh; для IP-сертификата действует короткий срок (~6 дней).
 HELP
 }
 while (($#)); do
   case "$1" in
-    --public-panel)
-      (($# >= 2)) || fail 'нужен домен или IP после --public-panel'
-      PUBLIC_PANEL_HOST="$2"; shift 2 ;;
+    --domain) (($# >= 2)) || fail 'укажите имя домена'; DOMAIN="$2"; shift 2 ;;
+    --ip) (($# >= 2)) || fail 'укажите IPv4'; IP_OVERRIDE="$2"; shift 2 ;;
+    --sync-ip) MODE='sync-ip'; shift ;;
     --firewall) FIREWALL=1; shift ;;
-    --ssh-port) (($# >= 2)) || fail 'нужен номер порта после --ssh-port'; SSH_PORT="$2"; shift 2 ;;
+    --ssh-port) (($# >= 2)) || fail 'укажите номер порта'; SSH_PORT="$2"; shift 2 ;;
     --check) MODE='check'; shift ;;
     --rollback-tuning) MODE='rollback'; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "неизвестный параметр: $1" ;;
   esac
 done
+[[ -z "$DOMAIN" || -z "$IP_OVERRIDE" ]] || fail 'одновременно --domain и --ip недопустимы'
+
+is_ipv4() {
+  local ip="$1" a b c d v
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r a b c d <<< "$ip"
+  for v in "$a" "$b" "$c" "$d"; do
+    [[ "$v" =~ ^[0-9]{1,3}$ ]] && ((10#$v <= 255)) || return 1
+  done
+  return 0
+}
+
+# Отсекаем локальные, тестовые и зарезервированные диапазоны адресов.
+is_public_ipv4() {
+  is_ipv4 "$1" || return 1
+  local a b c d
+  IFS=. read -r a b c d <<< "$1"
+  a=$((10#$a)); b=$((10#$b)); c=$((10#$c))
+  (( a >= 1 && a <= 223 )) || return 1
+  (( a != 10 && a != 127 )) || return 1
+  (( !(a == 172 && b >= 16 && b <= 31) )) || return 1
+  (( !(a == 192 && b == 168) )) || return 1
+  (( !(a == 169 && b == 254) )) || return 1
+  (( !(a == 100 && b >= 64 && b <= 127) )) || return 1
+  (( !(a == 198 && b >= 18 && b <= 19) )) || return 1
+  (( !(a == 192 && b == 0 && (c == 0 || c == 2)) )) || return 1
+  (( !(a == 198 && b == 51 && c == 100) )) || return 1
+  (( !(a == 203 && b == 0 && c == 113) )) || return 1
+}
+
+detect_ip() {
+  local ip url
+  for url in https://api4.ipify.org https://ipv4.icanhazip.com; do
+    ip="$(curl -4fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if is_public_ipv4 "$ip"; then printf '%s\n' "$ip"; return 0; fi
+  done
+  return 1
+}
+
+validate_domain() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$ && "$1" == *.* && ${#1} -le 253 ]] || fail 'некорректное имя домена'
+}
+
+get_target() {
+  if [[ -n "$DOMAIN" ]]; then
+    validate_domain "$DOMAIN"
+    TARGET_MODE='domain'; TARGET_HOST="$DOMAIN"
+  elif [[ -n "$IP_OVERRIDE" ]]; then
+    is_public_ipv4 "$IP_OVERRIDE" || fail 'нужен публичный IPv4'
+    TARGET_MODE='ip'; TARGET_HOST="$IP_OVERRIDE"
+  elif [[ -f "$MODE_FILE" && "$(cat "$MODE_FILE")" == domain && -f "$HOST_FILE" ]]; then
+    TARGET_MODE='domain'; TARGET_HOST="$(cat "$HOST_FILE")"
+    validate_domain "$TARGET_HOST"
+  else
+    TARGET_MODE='ip'; TARGET_HOST="$(detect_ip)" || fail 'не удалось узнать публичный IPv4; укажите --ip'
+  fi
+}
+
+# Обновление сертификата: выполняется только если IP действительно поменялся.
+sync_ip() {
+  require_root
+  [[ -r "$MODE_FILE" && -r "$HOST_FILE" ]] || fail 'установка ещё не завершена'
+  [[ "$(cat "$MODE_FILE")" == ip ]] || { log 'Для домена сертификат привязан к имени; обновите DNS при смене IP.'; return 0; }
+  [[ -r "$INSTALLER_CACHE" ]] || fail "не найден $INSTALLER_CACHE"
+  local next old
+  old="$(cat "$HOST_FILE")"
+  next="${IP_OVERRIDE:-$(detect_ip)}" || fail 'не получилось определить новый IP'
+  is_public_ipv4 "$next" || fail 'нужен публичный IPv4'
+  if [[ "$old" == "$next" ]]; then log "IP не изменился: $next"; return 0; fi
+  if ss -H -ltn 'sport = :80' | grep -q .; then fail 'TCP 80 занят — ACME HTTP-01 не сможет пройти; освободите порт'; fi
+  log "Новый IP: $old → $next. Запрашиваю сертификат Let's Encrypt..."
+  if bash "$INSTALLER_CACHE" --ssl-menu --ssl-ip "$next"; then
+    [[ -s /root/cert/ip/fullchain.pem ]] || fail 'не обнаружен установленный сертификат'
+    printf '%s\n' "$next" > "${HOST_FILE}.new"
+    mv -f "${HOST_FILE}.new" "$HOST_FILE"
+    if [[ -x /root/.acme.sh/acme.sh ]]; then
+      /root/.acme.sh/acme.sh --remove -d "$old" >/dev/null 2>&1 || log 'Не удалось исключить старый IP из автопродления.'
+    fi
+    log "Новый сертификат установлен: https://${next}:2053/"
+  else
+    fail "Не удалось выпустить сертификат на $next. Старый адрес сохранён; следующая попытка по таймеру."
+  fi
+}
 
 require_root() { ((EUID == 0)) || fail 'запустите от root: sudo bash deploy.sh'; }
 
 status() {
   log "Ядро Linux: $(uname -r)"
-  log "congestion-control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
+  if [[ -r "$MODE_FILE" && -r "$HOST_FILE" ]]; then log "Адрес панели: https://$(cat "$HOST_FILE"):2053/ ($(cat "$MODE_FILE"))"; fi
+  log "TCP congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
   log "Дисциплина очереди: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)"
   log "somaxconn: $(sysctl -n net.core.somaxconn 2>/dev/null || echo n/a)"
   log "Максимальный UDP-буфер приёма: $(sysctl -n net.core.rmem_max 2>/dev/null || echo n/a)"
@@ -93,6 +184,7 @@ rollback() {
 
 if [[ "$MODE" == check ]]; then status; exit 0; fi
 if [[ "$MODE" == rollback ]]; then rollback; exit 0; fi
+if [[ "$MODE" == sync-ip ]]; then sync_ip; exit 0; fi
 require_root
 
 [[ -r /etc/os-release ]] || fail 'не удалось определить ОС'
@@ -107,25 +199,6 @@ case "$(uname -m)" in
   *) fail 'нужен процессор amd64 или arm64' ;;
 esac
 
-# Публичная панель открывается только с TLS, по явному запросу.
-TLS_ARGS=(--no-ssl)
-PANEL_BIND='127.0.0.1'
-if [[ -n "$PUBLIC_PANEL_HOST" ]]; then
-  [[ "$PUBLIC_PANEL_HOST" =~ ^[A-Za-z0-9.-]+$ && "$PUBLIC_PANEL_HOST" != -* ]] || fail 'некорректный домен/IP для публичного GUI'
-  if systemctl cat m-ui.service >/dev/null 2>&1; then
-    fail 'GUI уже установлен. Перенастройте его через m-ui ssl / m-ui configure.'
-  fi
-  PANEL_BIND='0.0.0.0'
-  if [[ "$PUBLIC_PANEL_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    IFS=. read -r a b c d <<< "$PUBLIC_PANEL_HOST"
-    for octet in "$a" "$b" "$c" "$d"; do
-      [[ "$octet" =~ ^[0-9]{1,3}$ ]] && ((10#$octet <= 255)) || fail 'некорректный IPv4'
-    done
-    TLS_ARGS=(--ssl-ip "$PUBLIC_PANEL_HOST")
-  else
-    TLS_ARGS=(--ssl-domain "$PUBLIC_PANEL_HOST")
-  fi
-fi
 
 if ((FIREWALL)); then
   [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && ((SSH_PORT >= 1 && SSH_PORT <= 65535)) || fail 'укажите действующий порт SSH через --ssh-port'
@@ -151,6 +224,22 @@ fi
 log 'Устанавливаю системные зависимости'
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl openssl gzip tar procps iproute2 kmod cron socat
+# Определяем внешний IP только после установки curl.
+get_target
+log "TLS-адрес панели: $TARGET_HOST ($TARGET_MODE)"
+# Если UFW уже включён — открываем только порты панели и ACME.
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  ufw allow 80/tcp comment 'ACME test-tspu'
+  ufw allow "${PANEL_PORT}/tcp" comment 'HTTPS m-ui test-tspu'
+fi
+if [[ "$TARGET_MODE" == domain ]]; then
+  # Проверка информативна: DNS-провайдер может возвращать несколько адресов.
+  PUBLIC_IP="$(detect_ip)" || fail 'не удаётся определить IP для проверки DNS'
+  if ! getent ahostsv4 "$TARGET_HOST" | awk '{print $1}' | grep -Fx "$PUBLIC_IP" >/dev/null; then
+    fail "A-запись $TARGET_HOST не указывает на текущий публичный IP VPS. Проверьте DNS до выпуска TLS."
+  fi
+fi
+
 
 log 'Применяю умеренные сетевые настройки; BBR — только при поддержке ядром'
 if [[ -f "$TUNING_FILE" ]] && ! grep -q '^# managed by test-tspu deploy.sh$' "$TUNING_FILE"; then
@@ -217,11 +306,16 @@ if ! systemctl cat m-ui.service >/dev/null 2>&1; then
   [[ -n "$PANEL_BIN" ]] || PANEL_BIN="$(find "${TMP_DIR}/unpack" -type f -name "m-ui-linux-${ARCH}" -print -quit)"
   [[ -n "$PANEL_BIN" ]] || fail 'в архиве нет исполняемого файла m-ui'
   chmod 0755 "$PANEL_BIN"
-  curl --fail --location --silent --show-error --retry 3 "$INSTALLER_URL" -o "${TMP_DIR}/m-ui-install.sh"
-  MUI_BINARY_PATH="$PANEL_BIN" bash "${TMP_DIR}/m-ui-install.sh" \
-    --version "$PANEL_VERSION" --skip-mihomo --listen-ip "$PANEL_BIND" --port "$PANEL_PORT" "${TLS_ARGS[@]}"
+  curl --fail --location --silent --show-error --retry 3 "$INSTALLER_URL" -o "$INSTALLER_CACHE"
+  chmod 0600 "$INSTALLER_CACHE"
+  MUI_BINARY_PATH="$PANEL_BIN" bash "$INSTALLER_CACHE" \
+    --version "$PANEL_VERSION" --skip-mihomo --listen-ip 127.0.0.1 --port "$PANEL_PORT" --no-ssl
 else
   log 'm-ui уже установлен — учётные данные и настройки сохраняются'
+fi
+if [[ ! -s "$INSTALLER_CACHE" ]]; then
+  curl --fail --location --silent --show-error --retry 3 "$INSTALLER_URL" -o "$INSTALLER_CACHE"
+  chmod 0600 "$INSTALLER_CACHE"
 fi
 
 mkdir -p "$DROPIN_DIR"
@@ -235,26 +329,75 @@ systemctl enable m-ui.service
 systemctl restart m-ui.service
 systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился (проверьте journalctl -u m-ui -n 80)'
 
+PREV_MODE="$(cat "$MODE_FILE" 2>/dev/null || true)"
+PREV_HOST="$(cat "$HOST_FILE" 2>/dev/null || true)"
+if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" ]] || { [[ "$TARGET_MODE" == ip && ! -s /root/cert/ip/fullchain.pem ]]; }; then
+  if ss -H -ltn 'sport = :80' | grep -q .; then fail 'TCP 80 занят — ACME HTTP-01 не сможет пройти; освободите порт'; fi
+  log "Выпускаю TLS-сертификат: $TARGET_HOST"
+  if [[ "$TARGET_MODE" == ip ]]; then
+    bash "$INSTALLER_CACHE" --ssl-menu --ssl-ip "$TARGET_HOST" || fail 'IP-сертификат не выпущен; GUI остаётся локальным'
+  else
+    bash "$INSTALLER_CACHE" --ssl-menu --ssl-domain "$TARGET_HOST" || fail 'доменный сертификат не выпущен; GUI остаётся локальным'
+  fi
+  printf '%s\n' "$TARGET_MODE" > "${MODE_FILE}.new"
+  printf '%s\n' "$TARGET_HOST" > "${HOST_FILE}.new"
+  mv -f "${MODE_FILE}.new" "$MODE_FILE"
+  mv -f "${HOST_FILE}.new" "$HOST_FILE"
+fi
+
+# Не публикуем HTTP GUI до успешного HTTPS.
+systemctl stop m-ui.service
+/usr/local/m-ui/m-ui configure --data-dir /usr/local/m-ui/data --listen-ip 0.0.0.0 >/dev/null
+systemctl start m-ui.service
+systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился после активации HTTPS'
+
+# Сохраняем локальную копию единственного установочного файла для автопроверки смены IP.
+if [[ -f "${BASH_SOURCE[0]}" ]]; then
+  install -m 0700 "${BASH_SOURCE[0]}" "$SELF_PATH"
+else
+  fail 'Нужно запускать скачанный файл, а не поток в bash'
+fi
+cat > /etc/systemd/system/test-tspu-ip-check.service <<'UNIT'
+[Unit]
+Description=Проверка IP для сертификата m-ui
+After=network-online.target m-ui.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/test-tspu-deploy --sync-ip
+UNIT
+cat > /etc/systemd/system/test-tspu-ip-check.timer <<'UNIT'
+[Unit]
+Description=Проверка смены IP и обновление HTTPS-панели
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+RandomizedDelaySec=3min
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now test-tspu-ip-check.timer
+
+
 if ((FIREWALL)); then
   log 'Включаю UFW; порты для протоколов нужно открыть отдельно'
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ufw
   ufw allow "${SSH_PORT}/tcp" comment 'SSH - test-tspu'
-  if [[ -n "$PUBLIC_PANEL_HOST" ]]; then
-    ufw allow "${PANEL_PORT}/tcp" comment 'HTTPS m-ui GUI'
-  fi
+  ufw allow 80/tcp comment 'ACME HTTPS test-tspu'
+  ufw allow "${PANEL_PORT}/tcp" comment 'HTTPS m-ui GUI'
   ufw --force enable
 fi
 
-log 'Установка завершена.'
-if [[ -n "$PUBLIC_PANEL_HOST" ]]; then
-  HTTP_CODE="$(curl --insecure --silent --connect-timeout 5 --max-time 10 --output /dev/null --write-out '%{http_code}' "https://127.0.0.1:${PANEL_PORT}/" || true)"
-  [[ "$HTTP_CODE" != 000 && -n "$HTTP_CODE" ]] || fail 'не удалось подтвердить HTTPS GUI, проверьте сертификат и логи m-ui'
-  log "Публичная панель: https://${PUBLIC_PANEL_HOST}:${PANEL_PORT}/ (путь и пароль показаны установщиком m-ui)"
-  log 'Откройте порт панели в firewall хостера, а также необходимые порты для ACME.'
-else
-  log 'Панель только на 127.0.0.1:2053 — доступ через SSH-туннель.'
-  log 'Подключение: ssh -L 2053:127.0.0.1:2053 user@IP_СЕРВЕРА'
+# Для предотвращения ложного успеха проверяем TLS с корректным именем/IP,
+# а не просто ответ на 127.0.0.1 с --insecure.
+if ! curl --noproxy '*' -sS --connect-timeout 5 --max-time 10 --resolve "${TARGET_HOST}:${PANEL_PORT}:127.0.0.1" "https://${TARGET_HOST}:${PANEL_PORT}/" -o /dev/null; then
+  fail "HTTPS на ${TARGET_HOST}:${PANEL_PORT} не прошёл проверку. Проверьте TLS и DNS."
 fi
-log 'Для проверки тестового передайте адрес сервера и клиентский профиль, а не доступ к админке.'
-log 'Для новых inbound откройте соответствующие TCP/UDP-порты.'
+log "Готово: https://${TARGET_HOST}:${PANEL_PORT}/"
+log 'Путь, логин и пароль выведены установщиком m-ui. Сохраните их.'
+log 'Откройте во внешнем firewall TCP 80 (сертификаты) и TCP 2053 (GUI).'
+log 'Для изменения IP можно повторить установку с --ip АДРЕС или дождаться проверки по таймеру.'
+log 'Клиентские подключения и их порты создаются отдельно в GUI.'
 status
