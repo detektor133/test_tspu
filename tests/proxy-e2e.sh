@@ -99,7 +99,9 @@ config['mode']='rule'
 config['external-controller']='127.0.0.1:19091'
 config['secret']='ci-local-only'
 config['log-level']='warning'
-config['rules']=['MATCH,PROXY']
+config['proxy-groups']=[{'name':'E2E', 'type':'select',
+                         'proxies':[proxy['name'] for proxy in proxies]}]
+config['rules']=['MATCH,E2E']
 (root/'client.yaml').write_text(yaml.safe_dump(config,sort_keys=False,allow_unicode=True))
 (root/'targets.json').write_text(json.dumps([
     {'port':int(x['port']),'type':x['type'],'name':x['name']}
@@ -124,7 +126,7 @@ ready=0
 for _ in {1..35}; do
   if curl --silent --fail --noproxy '*' --max-time 1 \
     -H 'Authorization: Bearer ci-local-only' \
-    'http://127.0.0.1:19091/proxies/PROXY' >/dev/null; then
+    'http://127.0.0.1:19091/proxies/E2E' >/dev/null; then
     ready=1
     break
   fi
@@ -144,7 +146,7 @@ PY
   curl --noproxy '*' --silent --show-error --fail --max-time 4 \
     --request PUT --header 'Authorization: Bearer ci-local-only' \
     --header 'Content-Type: application/json' \
-    --data "$payload" "http://127.0.0.1:19091/proxies/PROXY" >/dev/null ||
+    --data "$payload" "http://127.0.0.1:19091/proxies/E2E" >/dev/null ||
       fatal "не получилось выбрать $kind/$port"
   ok=0
   for _ in {1..2}; do
