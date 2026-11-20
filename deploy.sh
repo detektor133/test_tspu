@@ -187,7 +187,16 @@ update_duckdns() {
 sync_ip() {
   require_root
   [[ -r "$MODE_FILE" && -r "$HOST_FILE" ]] || fail 'установка ещё не завершена'
-  [[ "$(cat "$MODE_FILE")" == ip ]] || { log 'Для домена сертификат привязан к имени; обновите DNS при смене IP.'; return 0; }
+  if [[ "$(cat "$MODE_FILE")" != ip ]]; then
+    if [[ -s "$DUCKDNS_HOST_FILE" && -s "$DUCKDNS_TOKEN_FILE" ]]; then
+      local new_public_ip
+      new_public_ip="${IP_OVERRIDE:-$(detect_ip)}" || fail 'не удалось определить новый IP для DuckDNS'
+      update_duckdns "$new_public_ip"
+    else
+      log 'Для обычного домена сертификат привязан к имени; обновите DNS при смене IP.'
+    fi
+    return 0
+  fi
   [[ -r "$INSTALLER_CACHE" ]] || fail "не найден $INSTALLER_CACHE"
   local next old
   old="$(cat "$HOST_FILE")"
@@ -318,8 +327,31 @@ if ((${#missing_packages[@]})); then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing_packages[@]}"
   change "установлены пакеты: ${missing_packages[*]}"
 fi
+# Указываем DuckDNS один раз; после этого настройки сохраняются на VPS.
+if [[ -n "$DUCKDNS_HOST" ]]; then
+  NEW_DUCKDNS="$(duckdns_name "$DUCKDNS_HOST").duckdns.org"
+  if [[ -n "$DUCKDNS_TOKEN_SOURCE" ]]; then
+    [[ -s "$DUCKDNS_TOKEN_SOURCE" && -r "$DUCKDNS_TOKEN_SOURCE" ]] ||
+      fail 'токен DuckDNS недоступен'
+    # Не выдаём токен ни в командной строке curl, ни в журнале.
+    install -m 0600 "$DUCKDNS_TOKEN_SOURCE" "$DUCKDNS_TOKEN_FILE"
+    change 'обновлён токен DuckDNS'
+  elif [[ ! -s "$DUCKDNS_TOKEN_FILE" ]]; then
+    fail 'для первого подключения DuckDNS нужен --duckdns-token-file'
+  fi
+  if [[ "$(cat "$DUCKDNS_HOST_FILE" 2>/dev/null || true)" != "$NEW_DUCKDNS" ]]; then
+    printf '%s\n' "$NEW_DUCKDNS" > "$DUCKDNS_HOST_FILE"
+    chmod 0600 "$DUCKDNS_HOST_FILE"
+    rm -f "$DUCKDNS_IP_FILE"
+    change "домен DuckDNS: $NEW_DUCKDNS"
+  fi
+fi
 # Определяем внешний IP только после установки curl.
 get_target
+if [[ -s "$DUCKDNS_HOST_FILE" && "$TARGET_HOST" == "$(cat "$DUCKDNS_HOST_FILE")" ]]; then
+  DDNS_UPDATE_IP="${IP_OVERRIDE:-$(detect_ip)}" || fail 'не удалось определить публичный IP для DuckDNS'
+  update_duckdns "$DDNS_UPDATE_IP"
+fi
 log "TLS-адрес панели: $TARGET_HOST ($TARGET_MODE)"
 # Если UFW уже включён — открываем только порты панели и ACME.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
