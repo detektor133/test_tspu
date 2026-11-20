@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline regression tests; do not claim these simulate RF networks or DPI."""
 import csv
+import io
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -24,7 +25,8 @@ from field_modes import (choose_mode, minimum_budget_mib, classify,
 from http_benchmark import HEADERS, run_level, percentile_or_missing
 from compare_runs import combine
 import vps_session
-from port_capture import parse_ingress_ipv4, port_evidence
+from port_capture import parse_ingress_ipv4, port_evidence, EVIDENCE_FIELDS
+from field_modes import measurement_csv_fields
 from http_benchmark import request_once
 
 
@@ -119,6 +121,40 @@ class TestFieldReport(unittest.TestCase):
         fragment = bytearray(packet(6, 8388))
         fragment[6:8] = struct.pack("!H", 1)
         self.assertIsNone(parse_ingress_ipv4(fragment))
+
+    def test_all_packet_evidence_fields_survive_csv_writer(self):
+        # Regression: smoke passed all seven VPNs but Android crashed while
+        # serializing the previously unlisted noise_threshold_packets column.
+        csv_fields = measurement_csv_fields(HEADERS, EVIDENCE_FIELDS)
+        zero = {"available": True, "active": True, "source_filtered": True,
+                "counters": {"8388/tcp": {"packets": 0, "ip_bytes": 0},
+                             "443/tcp": {"packets": 0, "ip_bytes": 0}}}
+        for own, foreign in ((55, 0), (55, 2), (55, 100), (0, 0)):
+            after = {"available": True, "active": True, "source_filtered": True,
+                     "counters": {"8388/tcp": {"packets": own, "ip_bytes": own * 70},
+                                  "443/tcp": {"packets": foreign, "ip_bytes": foreign * 60}}}
+            proof = port_evidence(zero, after, "8388/tcp")
+            self.assertEqual(set(proof), set(EVIDENCE_FIELDS))
+            row = {"network": "sbermobile", "protocol": "Shadowsocks",
+                   "proxy_name": "fixture", "status": "smoke_pass",
+                   "mode": "smoke", "error": "", "concurrency": 1,
+                   "requests_total": 3, "requests_ok": 3, **proof}
+            stream = io.StringIO()
+            writer = csv.DictWriter(stream, fieldnames=csv_fields)
+            writer.writeheader()
+            writer.writerow(row)
+            parsed = next(csv.DictReader(io.StringIO(stream.getvalue())))
+            self.assertEqual(int(parsed["noise_threshold_packets"]),
+                             proof["noise_threshold_packets"])
+            self.assertEqual(parsed["route_status"], proof["route_status"])
+
+        # A partially skipped protocol must also be serializable.
+        stream = io.StringIO()
+        csv.DictWriter(stream, fieldnames=csv_fields).writerow({
+            "network": "sbermobile", "protocol": "Trojan",
+            "proxy_name": "", "status": "missing", "error": "no profile",
+            "date_utc": "", "started_utc": "", "ended_utc": "",
+        })
 
     def test_port_evidence_rejects_missing_or_contaminated_port(self):
         empty = {"available": True, "active": True, "source_filtered": True, "counters": {

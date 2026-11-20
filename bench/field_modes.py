@@ -25,6 +25,16 @@ DEFAULTS = {
              "max_mib": 512, "ping_interval": .2},
 }
 
+def measurement_csv_fields(benchmark_headers, evidence_fields):
+    """One CSV contract shared by Android execution and offline regression tests."""
+    fields = (["network", "protocol", "proxy_name", "status", "mode", "error",
+               "cumulative_mib", "protocol_cumulative_mib"]
+              + list(evidence_fields) + list(benchmark_headers))
+    if len(fields) != len(set(fields)):
+        raise ValueError("Повторяющиеся поля в CSV измерений")
+    return fields
+
+
 WINDOW_FIELDS = ["network", "protocol", "concurrency", "window_start_sec",
                  "window_seconds", "downloads_total", "downloads_ok",
                  "bytes_ok", "throughput_mib_s", "ping_total", "ping_ok",

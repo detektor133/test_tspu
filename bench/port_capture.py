@@ -21,6 +21,12 @@ PORTS = {
     "443/tcp", "11443/tcp", "14443/udp", "8443/udp",
     "8388/tcp", "8388/udp", "9443/tcp", "10443/tcp",
 }
+# Keep the packet-evidence schema in one place. Android CSV headers reuse
+# it, so a new counter cannot silently break result serialization.
+EVIDENCE_FIELDS = (
+    "route_status", "route_port", "route_packets", "route_ip_bytes",
+    "unexpected_port_packets", "noise_threshold_packets",
+)
 ETH_P_IP = 0x0800
 
 

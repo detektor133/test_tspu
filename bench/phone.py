@@ -27,9 +27,10 @@ except ImportError:
 
 from http_benchmark import HEADERS, run_level, request_once
 from generate_report import generate
-from port_capture import port_evidence
+from port_capture import port_evidence, EVIDENCE_FIELDS
 from field_modes import (choose_mode, minimum_budget_mib, classify,
-                         windows_from_samples, WINDOW_FIELDS)
+                         windows_from_samples, WINDOW_FIELDS,
+                         measurement_csv_fields)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = Path.home() / ".config" / "test-tspu"
@@ -40,9 +41,7 @@ PORTS = [
     (14443, "Hysteria2"), (8443, "TUIC"), (8388, "Shadowsocks"),
     (9443, "Trojan"), (10443, "AnyTLS"),
 ]
-CSV_FIELDS = ["network", "protocol", "proxy_name", "status", "mode", "error",
-              "route_status", "route_port", "route_packets", "route_ip_bytes",
-              "unexpected_port_packets", "cumulative_mib", "protocol_cumulative_mib"] + HEADERS
+CSV_FIELDS = measurement_csv_fields(HEADERS, EVIDENCE_FIELDS)
 SAMPLE_FIELDS = ["network", "protocol", "concurrency", "kind",
                  "started_utc", "ended_utc",
                  "ok", "bytes_ok", "ttfb_ms", "latency_ms", "error_type", "nonce"]
@@ -166,6 +165,13 @@ def run(a):
                 if node.get("type") != TYPES[label]:
                     raise SystemExit("Профиль на порту %d имеет тип %r вместо %s"
                                      % (port, node.get("type"), TYPES[label]))
+                if label == "VLESS REALITY":
+                    if node.get("flow") != "xtls-rprx-vision":
+                        raise SystemExit("Клиент VLESS REALITY: ожидался "
+                                         "flow=xtls-rprx-vision (XTLS Vision); "
+                                         "фактически он не указан или отличается")
+                    if not isinstance(node.get("reality-opts"), dict):
+                        raise SystemExit("Клиент VLESS REALITY: отсутствует reality-opts")
                 nodes[label] = node
     if not nodes:
         raise SystemExit("В подписке нет профилей для указанного VPS")
