@@ -36,6 +36,7 @@ jobs:
           bash deploy.sh --help
           bash deploy.sh --check
           if bash deploy.sh --unknown; then exit 1; fi
+          if bash deploy.sh --ui-language fr; then exit 1; fi
   integration:
     name: Установка и HTTPS (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
