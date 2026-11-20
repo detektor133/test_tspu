@@ -39,7 +39,7 @@ def combine(folders, output):
     indexed = {net: index(rows) for net, rows in datasets.items()}
     levels = sorted({level for data in indexed.values() for _, level in data})
     header = "| Протокол | Потоки | " + " | ".join(
-        net + ": OK/все · МиБ/с · p95, мс" for net in datasets) + " |"
+        net + ": OK/все · МиБ/с · HTTP ping p95, мс" for net in datasets) + " |"
     delimiter = "|---|---:|" + "|".join(["---:" for _ in datasets]) + "|"
     table = [header, delimiter]
     for protocol in ORDER:
@@ -59,7 +59,7 @@ def combine(folders, output):
                     columns.append("%s/%s · %s · %s" %
                                    (r.get("requests_ok", 0), r.get("requests_total", 0),
                                     r.get("throughput_mib_s", "—"),
-                                    r.get("latency_p95_ms") or "—"))
+                                    r.get("app_rtt_p95_ms") or "—"))
             table.append("| " + " | ".join(columns) + " |")
     # Для графика выбираем только совместимый уровень параллельности,
     # предпочтительно 8. Отсутствующие успешные измерения не сравниваем.
