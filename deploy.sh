@@ -209,7 +209,7 @@ sync_ip() {
       new_public_ip="${IP_OVERRIDE:-$(detect_ip)}" || fail 'не удалось определить новый IP для DuckDNS'
       update_duckdns "$new_public_ip"
     else
-      log 'Для обычного домена сертификат привязан к имени; обновите DNS при смене IP.'
+      log 'Для домена сертификат привязан к имени; обновите DNS при смене IP.'
     fi
     return 0
   fi
