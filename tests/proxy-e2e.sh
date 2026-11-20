@@ -36,12 +36,15 @@ fatal() {
 URL="$(sudo /usr/bin/python3 - <<'PY'
 from pathlib import Path
 f=Path('/var/lib/test-tspu/subscriptions.txt').read_text()
+section = None
 for line in f.splitlines():
-    if line.startswith('Mihomo/Clash: '):
+    if line.startswith('# Подписка: '):
+        section = line.removeprefix('# Подписка: ')
+    elif section == 'test' and line.startswith('Mihomo/Clash: '):
         print(line.removeprefix('Mihomo/Clash: '))
         break
 else:
-    raise SystemExit('Не создана подписка m-ui')
+    raise SystemExit('Не создана подписка пользователя test в m-ui')
 PY
 )"
 [[ "$URL" == "https://$HOST:2053/"* ]] || fatal 'некорректный адрес подписки'
@@ -53,6 +56,26 @@ curl --noproxy '*' --silent --show-error --fail \
   --max-time 10 "$URL" -o "$ROOT/subscription.yaml" ||
     fatal 'не удалось получить подписку по проверенному HTTPS'
 grep -q 'proxies:' "$ROOT/subscription.yaml" || fatal 'подписка не содержит прокси'
+
+# Клиентские форматы Android и страница с QR действительно доступны.
+BASE="${URL%/clash}"
+for FORMAT in v2rayng happ; do
+  curl --noproxy '*' --silent --show-error --fail \
+    --cacert "$CA" --resolve "$HOST:2053:127.0.0.1" \
+    --max-time 10 "$BASE/$FORMAT" -o "$ROOT/$FORMAT.b64" ||
+      fatal "недоступна Android-подписка $FORMAT"
+  base64 -d "$ROOT/$FORMAT.b64" > "$ROOT/$FORMAT.links" ||
+    fatal "Android-подписка $FORMAT не является Base64"
+  grep -Eq '^(vless|trojan|hysteria2|tuic|ss)://' "$ROOT/$FORMAT.links" ||
+    fatal "Android-подписка $FORMAT не содержит ссылок"
+  echo "E2E OK: Android-подписка $FORMAT"
+done
+curl --noproxy '*' --silent --show-error --fail \
+  --cacert "$CA" --resolve "$HOST:2053:127.0.0.1" \
+  --header 'Accept: text/html' --max-time 10 "$BASE" -o "$ROOT/qr.html" ||
+    fatal 'недоступна HTML-страница с QR'
+grep -Eiq 'qr|qrious' "$ROOT/qr.html" || fatal 'страница подписки не содержит QR-интерфейс'
+echo 'E2E OK: HTML-страница подписки с QR'
 
 # Проверка отсутствия доступа без правильного токена.
 bad_url="https://$HOST:2053/invalid-tspu-subscription-token/clash"
