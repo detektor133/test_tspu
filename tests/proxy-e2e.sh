@@ -127,11 +127,6 @@ done
 # сервер, доступ к которому происходит ЧЕРЕЗ выбранный удалённый inbound.
 while IFS=$'\t' read -r port kind name; do
   [[ -n "$name" ]] || continue
-  escaped="$(NAME="$name" python3 - <<'PY'
-import os,urllib.parse
-print(urllib.parse.quote(os.environ['NAME'],safe=''))
-PY
-)"
   payload="$(NAME="$name" python3 - <<'PY'
 import json,os
 print(json.dumps({'name':os.environ['NAME']}))
