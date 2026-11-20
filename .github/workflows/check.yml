@@ -1,0 +1,17 @@
+name: Lint deployment
+on:
+  push:
+  pull_request:
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n deploy.sh
+      - name: ShellCheck
+        run: shellcheck -S warning deploy.sh
+      - name: Help and read-only healthcheck
+        run: |
+          bash deploy.sh --help
+          bash deploy.sh --check
