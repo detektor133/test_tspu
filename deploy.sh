@@ -801,7 +801,9 @@ def reality_key():
 
 def is_tcp(item):
     return item.get('type') not in ('hysteria2', 'tuic')
+created_count = 0
 def add(inbound):
+    global created_count
     name, port = inbound['name'], inbound['port']
     if name in names:
         print(f'Без изменений: {name}')
@@ -826,6 +828,7 @@ def add(inbound):
     api('POST', 'api/inbounds/import', {'yaml': json.dumps(inbound)})
     names.add(name)
     existing.append(inbound)
+    created_count += 1
     print(f'Создан inbound: {name} на {port}/{protocol}')
 
 # Семь независимых вариантов с уникальными секретами и стабильными именами.
@@ -836,7 +839,7 @@ add({'name': ssname, 'type': 'shadowsocks', 'port': 8388, 'listen': '0.0.0.0',
 
 hyname = 'test-tspu-hysteria2'
 hypw = get_secret(hyname, 'password', token)
-add({'name': hyname, 'type': 'hysteria2', 'port': 443, 'listen': '0.0.0.0',
+add({'name': hyname, 'type': 'hysteria2', 'port': 14443, 'listen': '0.0.0.0',
      'users': {'test': hypw}, 'alpn': ['h3'], 'certificate': crt, 'private-key': key,
      'up': 1000, 'down': 1000})
 
@@ -887,7 +890,10 @@ else:
     print('Без изменений: REALITY')
 
 api('POST', 'api/core/test')
-# m-ui сохраняет inbounds в state; ядро применяет после контролируемого перезапуска.
+if created_count:
+    api('POST', 'api/core/restart')
+    print(f'Mihomo: применено новых inbounds: {created_count}')
+# m-ui сохраняет inbounds в state, изменения применяются через API.
 print('Готово: inbounds сохранены через m-ui API')
 PY
   then
