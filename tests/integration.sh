@@ -114,6 +114,23 @@ for port in 14443 8443; do
   }
 done
 
+log "Сквозные тесты: Android/Mihomo-подписка, TLS и HTTP через каждый inbound"
+bash tests/proxy-e2e.sh 8.8.8.8 "$TMP/ca.pem"
+
+log "Проверка секретов и локального API"
+sudo stat -c %a /var/lib/test-tspu/subscriptions.txt | grep -qx 600
+sudo stat -c %a /var/lib/test-tspu/panel-user | grep -qx 600
+sudo stat -c %a /var/lib/test-tspu/panel-password | grep -qx 600
+sudo ss -lnt | grep -Eq '127[.]0[.]0[.]1:9093[[:space:]]'
+if sudo ss -lnt | grep -Eq '(^|[[:space:]])(0[.]0[.]0[.]0|\*):9093[[:space:]]'; then
+  echo 'API Mihomo доступен публично!' >&2
+  exit 1
+fi
+if grep -Eq '^(Username|Password):' "$TMP/install.log"; then
+  echo 'Пароли m-ui попали в лог инсталлятора' >&2
+  exit 1
+fi
+
 log "Повторный деплой: отсутствие изменений и прежний PID"
 pid_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
 sysctl_before="$(sudo stat -c %Y /etc/sysctl.d/90-test-tspu.conf)"
