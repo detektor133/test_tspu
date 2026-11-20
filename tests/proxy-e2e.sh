@@ -24,6 +24,11 @@ fatal() {
       grep -Ei 'error|warn|fail|panic|invalid' "$logfile" | tail -18 >&2 || true
     fi
   done
+  if [[ -s "$ROOT/validate.log" ]]; then
+    # Прячем возможные значения секретов в тексте ошибки.
+    sed -E 's/(password|uuid|private-key|token|secret):[^[:space:]]+/\1:[СКРЫТО]/Ig' \
+      "$ROOT/validate.log" | tail -20 >&2
+  fi
   exit 1
 }
 
