@@ -236,6 +236,27 @@ PY
   fi
 }
 
+# Публичные URL статических подписок обновляем при замене IP;
+# защищённые токены и пользовательские настройки m-ui не меняем.
+refresh_subscription_host() {
+  local previous="$1" current="$2"
+  [[ -s "$DATA_DIR/subscriptions.txt" && "$previous" != "$current" ]] || return 0
+  PREVIOUS_HOST="$previous" CURRENT_HOST="$current" python3 - <<'PY'
+import os, pathlib, tempfile
+p=pathlib.Path('/var/lib/test-tspu/subscriptions.txt')
+previous='https://'+os.environ['PREVIOUS_HOST']+':2053/'
+current='https://'+os.environ['CURRENT_HOST']+':2053/'
+content=p.read_text()
+updated=content.replace(previous,current)
+if updated != content:
+    fd,tmp=tempfile.mkstemp(prefix='.subscription-host-',dir=p.parent)
+    with os.fdopen(fd,'w') as out:
+        out.write(updated)
+    os.chmod(tmp,0o600)
+    os.replace(tmp,p)
+PY
+}
+
 # Обновление сертификата: выполняется только если IP действительно поменялся.
 sync_ip() {
   require_root
@@ -263,6 +284,7 @@ sync_ip() {
     [[ -s /root/cert/ip/fullchain.pem ]] || fail 'не обнаружен установленный сертификат'
     printf '%s\n' "$next" > "${HOST_FILE}.new"
     mv -f "${HOST_FILE}.new" "$HOST_FILE"
+    refresh_subscription_host "$old" "$next"
     sync_listener_tls
     if [[ -x /root/.acme.sh/acme.sh ]]; then
       /root/.acme.sh/acme.sh --remove -d "$old" >/dev/null 2>&1 || log 'Не удалось исключить старый IP из автопродления.'
