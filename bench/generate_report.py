@@ -189,7 +189,11 @@ def generate(folder):
                         for label in ORDER)
     details = "\n".join(reported)
     limits = "\n".join("- " + note for note in notes)
-    status = "Полноценный бенчмарк" if len(good) == len([r for r in rows if r.get("protocol") in ORDER]) and not absent and not meta.get("error") else "Пробный/неполный прогон"
+    expected_levels = len(ORDER) * len(meta.get("levels", []))
+    complete = (bool(expected_levels) and len(good) == expected_levels
+                and not absent and not meta.get("error")
+                and bool(resources) and all(resources_for(r, resources) is not None for r in good))
+    status = "Полноценный бенчмарк" if complete else "Пробный/неполный прогон"
     document = """# Автоматический отчёт о полевом тестировании AnyModel
 
 **Статус:** {status}.
