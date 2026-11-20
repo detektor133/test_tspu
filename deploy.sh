@@ -452,8 +452,10 @@ NEED_CORE=0
 NEED_PANEL=0
 [[ "$CORE_INSTALLED" == *"$CORE_VERSION"* ]] || NEED_CORE=1
 [[ "$PANEL_INSTALLED" == *"$PANEL_VERSION"* ]] || NEED_PANEL=1
-if ! systemctl cat m-ui.service >/dev/null 2>&1 || [[ ! -s "$PANEL_DATA/state.json" ]]; then
+if [[ ! -s "$PANEL_DATA/state.json" ]]; then
   PANEL_BOOTSTRAP=1
+  NEED_PANEL=1
+elif ! systemctl cat m-ui.service >/dev/null 2>&1; then
   NEED_PANEL=1
 fi
 
@@ -525,7 +527,7 @@ if ((NEED_PANEL)); then
   if ((PANEL_BOOTSTRAP)); then
     login="$(sed -n 's/^Username:[[:space:]]*//p' "${TMP_DIR}/mui-bootstrap.log" | tail -n 1)"
     password="$(sed -n 's/^Password:[[:space:]]*//p' "${TMP_DIR}/mui-bootstrap.log" | tail -n 1)"
-    if [[ -n "$login" && -n "$password" ]]; then
+    if [[ -n "$login" && -n "$password" && "$password" != unchanged* ]]; then
       printf '%s\n' "$login" > "$PANEL_USER_FILE"
       printf '%s\n' "$password" > "$PANEL_PASS_FILE"
       chmod 0600 "$PANEL_USER_FILE" "$PANEL_PASS_FILE"
