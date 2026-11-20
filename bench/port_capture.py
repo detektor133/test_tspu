@@ -47,6 +47,31 @@ def parse_ingress_ipv4(data):
     return key, total
 
 
+def port_evidence(before, after, expected):
+    """Independent ingress observation; fail closed when counters go backwards."""
+    if not (before.get("available") and after.get("available")):
+        raise RuntimeError("Счётчик пакетов VPS недоступен")
+    a, b = before.get("counters", {}), after.get("counters", {})
+    delta = {}
+    for port in b:
+        x, y = a.get(port, {}), b[port]
+        p = int(y.get("packets", 0)) - int(x.get("packets", 0))
+        z = int(y.get("ip_bytes", 0)) - int(x.get("ip_bytes", 0))
+        if p < 0 or z < 0:
+            raise RuntimeError("Счётчики VPS сбросились во время теста")
+        delta[port] = (p, z)
+    if expected not in delta:
+        raise RuntimeError("Нет счётчика для " + expected)
+    others = sum(p for key, (p, _) in delta.items() if key != expected)
+    packets, ip_bytes = delta[expected]
+    return {"route_status": ("verified" if packets and not others else
+                             "ambiguous" if packets else "no_ingress"),
+            "route_port": expected,
+            "route_packets": packets, "route_ip_bytes": ip_bytes,
+            "unexpected_port_packets": others}
+
+
+
 def save_state(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".port-counter-", dir=path.parent)
