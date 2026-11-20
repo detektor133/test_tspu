@@ -266,15 +266,27 @@ def run(a):
                                         262144, expected, 262144, max_requests=quota)
                 t1 = now()
                 budget -= measurement["requests_total"]
+                # Functional success is not automatically a valid sustained benchmark.
+                if not measurement["requests_ok"]:
+                    quality = "failed"
+                elif measurement["measurement_status"] == "budget_limited":
+                    quality = "budget_limited"
+                elif measurement["latency_samples"] < 20:
+                    quality = "insufficient_samples"
+                else:
+                    quality = "ok"
                 row = {"network": a.network, "protocol": label,
-                       "proxy_name": name, "status": "ok" if measurement["requests_ok"] else "failed",
+                       "proxy_name": name, "status": quality,
                        "error": "", "date_utc": started_at, "started_utc": t0,
                        "ended_utc": t1, "label": a.network + " / " + label,
                        "concurrency": level, "seconds_configured": a.seconds, **measurement}
                 rows.append(row)
-                print("%s | %2d потоков | %d/%d OK | %.2f МиБ/с | p95 %.0f мс" %
+                p95 = ("%.0f мс" % row["latency_p95_ms"]
+                       if row["latency_p95_ms"] != "" else "н/д (<20 успешных ответов)")
+                print("%s | %2d потоков | %d/%d OK | %.2f МиБ/с | %.2f/%.2f с | %s | p95 %s" %
                       (label, level, row["requests_ok"], row["requests_total"],
-                       row["throughput_mib_s"], row["latency_p95_ms"]), flush=True)
+                       row["throughput_mib_s"], row["seconds_elapsed"], a.seconds,
+                       quality, p95), flush=True)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
         remote_error = "%s: %s" % (type(exc).__name__, str(exc)[:180])
         print("Ошибка теста: " + remote_error, file=sys.stderr)
@@ -304,7 +316,8 @@ def run(a):
                     "protocols_expected": [label for _, label in PORTS],
                     "profiles_found": len(nodes), "levels": levels,
                     "seconds_per_level": a.seconds, "max_mib": a.max_mib,
-                    "payload_bytes": 262144, "error": remote_error}
+                    "payload_bytes": 262144, "min_p95_samples": 20,
+                    "min_p99_samples": 100, "error": remote_error}
         (output / "environment.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
         from generate_report import generate
         generate(output)
@@ -312,8 +325,13 @@ def run(a):
         print("CSV: " + str(output / "measurements.csv"))
         print("CPU/RAM: " + str(output / "server-resources.csv"))
         print("Секретный private-mihomo.yaml остаётся ТОЛЬКО в приватном каталоге телефона.")
-        if remote_error or not any(row.get("status") == "ok" for row in rows):
-            raise SystemExit("Прогон неполный. Отчёт сохраняет ошибки; исправьте их и повторите.")
+        if any(row.get("status") in ("budget_limited", "insufficient_samples") for row in rows):
+            print("ВНИМАНИЕ: часть уровней — пробные/недостаточные измерения. "
+                  "Для сравнимого бенчмарка увеличьте --seconds и --max-mib; "
+                  "см. статусы и фактическое время в отчёте.")
+        if remote_error or not any(int(row.get("requests_ok", 0)) > 0 for row in rows):
+            raise SystemExit("Прогон неполный либо нет успешной передачи данных. "
+                             "Отчёт сохраняет ошибки; исправьте их и повторите.")
 
 
 def main():
