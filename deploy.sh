@@ -350,7 +350,11 @@ if [[ -n "$DUCKDNS_HOST" ]]; then
     [[ -s "$DUCKDNS_TOKEN_SOURCE" && -r "$DUCKDNS_TOKEN_SOURCE" ]] ||
       fail 'токен DuckDNS недоступен'
     # Не выдаём токен ни в командной строке curl, ни в журнале.
-    install -m 0600 "$DUCKDNS_TOKEN_SOURCE" "$DUCKDNS_TOKEN_FILE"
+    TOKEN_TEXT="$(tr -d '\r\n' < "$DUCKDNS_TOKEN_SOURCE")"
+    [[ "$TOKEN_TEXT" =~ ^[A-Za-z0-9-]{16,128}$ ]] || fail 'некорректный формат токена DuckDNS'
+    printf '%s' "$TOKEN_TEXT" > "$DUCKDNS_TOKEN_FILE"
+    chmod 0600 "$DUCKDNS_TOKEN_FILE"
+    unset TOKEN_TEXT
     change 'обновлён токен DuckDNS'
   elif [[ ! -s "$DUCKDNS_TOKEN_FILE" ]]; then
     fail 'для первого подключения DuckDNS нужен --duckdns-token-file'
@@ -373,6 +377,9 @@ log "TLS-адрес панели: $TARGET_HOST ($TARGET_MODE)"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ufw allow 80/tcp comment 'ACME test-tspu'
   ufw allow "${PANEL_PORT}/tcp" comment 'HTTPS m-ui test-tspu'
+  for spec in 443/tcp 14443/udp 8443/udp 8388/tcp 8388/udp 9443/tcp 10443/tcp 11443/tcp; do
+    ufw allow "$spec" comment 'Mihomo test-tspu'
+  done
 fi
 if [[ "$TARGET_MODE" == domain && -z "$CERT_FILE" ]]; then
   # Проверка информативна: DNS-провайдер может возвращать несколько адресов.
@@ -950,6 +957,9 @@ if ((FIREWALL)); then
   ufw allow "${SSH_PORT}/tcp" comment 'SSH - test-tspu'
   ufw allow 80/tcp comment 'ACME HTTPS test-tspu'
   ufw allow "${PANEL_PORT}/tcp" comment 'HTTPS m-ui GUI'
+  for spec in 443/tcp 14443/udp 8443/udp 8388/tcp 8388/udp 9443/tcp 10443/tcp 11443/tcp; do
+    ufw allow "$spec" comment 'Mihomo test-tspu'
+  done
   ufw --force enable
 fi
 
