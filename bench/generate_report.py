@@ -4,6 +4,7 @@ import csv
 from datetime import datetime, timezone
 import html
 import json
+import re
 from pathlib import Path
 import statistics
 import sys
@@ -42,16 +43,25 @@ def attach_evidence(folder, rows):
         controls_passed = False
     groups = {}
     ping_groups = {}
+    invalid_groups = set()
     for sample in samples:
         key = (sample.get("protocol"), str(sample.get("concurrency")))
-        (ping_groups if sample.get("kind") == "ping" else groups).setdefault(
-            key, []).append(sample)
+        if sample.get("kind") == "ping":
+            ping_groups.setdefault(key, []).append(sample)
+        elif sample.get("kind") == "download":
+            groups.setdefault(key, []).append(sample)
+        else:
+            invalid_groups.add(key)
     for row in rows:
         key = (row.get("protocol"), str(row.get("concurrency")))
         part = groups.get(key, [])
         ping_part = ping_groups.get(key, [])
         try:
-            complete = (len(part) == int(row.get("requests_total") or 0)
+            nonces = [v.get("nonce", "") for v in part + ping_part]
+            complete = (key not in invalid_groups
+                        and all(re.fullmatch(r"[0-9a-f]{24}", n) for n in nonces)
+                        and len(set(nonces)) == len(nonces)
+                        and len(part) == int(row.get("requests_total") or 0)
                         and len(part) > 0
                         and sum(int(v.get("ok") or 0) for v in part) ==
                             int(row.get("requests_ok") or 0)
@@ -85,6 +95,7 @@ def valid_level(row):
                 and int(float(row.get("requests_ok") or 0)) >= 20
                 and int(float(row.get("app_rtt_samples") or 0)) >= 20
                 and row.get("app_rtt_p95_ms") not in ("", None)
+                and int(float(row.get("peak_inflight") or 0)) >= int(float(row.get("concurrency") or 0))
                 and row.get("route_status") == "verified"
                 and int(float(row.get("route_packets") or 0)) > 0
                 and row.get("raw_samples_complete") is True
@@ -200,6 +211,11 @@ def generate(folder):
                    for label, group in by_label.items()}
     good = [x for label in ORDER for x in by_label[label] if valid_level(x)]
     quality_issues = [x for label in ORDER for x in by_label[label] if not valid_level(x)]
+    max_verified_parallel = {
+        label: max((int(num(r.get("concurrency"))) for r in by_label[label]
+                    if valid_level(r) and resources_for(r, resources) is not None), default=0)
+        for label in ORDER
+    }
     throughput = [(label, max((num(r.get("throughput_mib_s")) for r in by_label[label]
                                if valid_level(r)), default=0.0))
                   for label in ORDER]
@@ -254,12 +270,21 @@ def generate(folder):
         "для p95 требуется >=20, для p99 >=100. Недостаточные процентили показаны как «—».",
         "Пассивные счётчики порта VPS не аутентифицируют IP отправителя: при стороннем трафике "
         "на тестовом порту требуется изолировать VPS или дополнительная проверка источника.",
+        "На VPS учитываются только входящие IPv4-пакеты с IP источника управляющей SSH-сессии "
+        "Android. Если CGNAT использует иной внешний адрес для VPN-порта, доказательство "
+        "останется отсутствующим, а не будет подменено проверкой чужих пакетов.",
+        "Внутри нагрузочных ступеней измеряется реальный peak_inflight; меньше "
+        "запрошенных потоков означает неполную нагрузку.",
         "Поля cumulative_mib показывают накопленную полезную нагрузку прогонки; "
         "один рост ошибок после порога НЕ доказывает срабатывание DPI без повторов.",
         "Использование Mihomo и на сервере, и на клиенте ограничивает переносимость результатов на иные реализации.",
         "Один тайм-аут или падение скорости не доказывает вмешательство ТСПУ. Для таких выводов нужны повторные испытания и контрольные сети.",
         "Байты учитываются для успешных HTTP-ответов; ошибочные подключения и заголовки дают дополнительный неучтённый трафик.",
     ])
+    parallel_summary = "\n".join("| %s | %s |" %
+                                 (label, str(max_verified_parallel[label])
+                                  if max_verified_parallel[label] else "не подтверждено")
+                                 for label in ORDER)
     summary = "\n".join("| %s | %d/%d | %.1f |" %
                         (label, successful[label], totals[label],
                          transferred[label] / (1024 * 1024))
@@ -292,6 +317,16 @@ def generate(folder):
 профиль Mihomo. Подключения не использовали USB-модем, общий VPN на ПК или публикацию origin наружу.
 Между этапами ядро Mihomo на телефоне переключало маршрутизацию через локальный REST API.
 
+## Проверенный уровень параллельности
+
+Максимальная **наблюдавшаяся** параллельность, которая прошла весь интервал,
+дала достаточные выборки HTTP ping/скачиваний, подтверждённый маршрут и CPU/RAM
+(это НЕ абсолютный предел пропускной способности VPS):
+
+| Протокол | Максимум подтверждённых одновременных HTTP-запросов |
+|---|---:|
+{parallel_summary}
+
 ## Сравнение протоколов
 
 | Протокол | Успешные/все запросы | Подтверждённый трафик, МиБ |
@@ -303,7 +338,7 @@ def generate(folder):
 {details}
 
 100% CPU = одно занятое логическое ядро; это не процент всех ядер VPS.
-Статус `ok` означает, что плановая длительность выдержана, подтверждён корректный порт VPS и отрицательные контроли, и есть >=20 успешных скачиваний и HTTP ping. `budget_limited` означает завершение из-за лимита до таймера; `insufficient_samples` — слишком мало успешных ответов. Строки с этими статусами полезны как функциональная проверка, но НЕ сопоставимы как полноценный нагрузочный тест. p95 доступен только при >=20 успешных ответах, p99 — при >=100. Недоступные метрики указаны «—», а не нулём.
+Статус `ok` означает, что выдержана плановая длительность и реально достигнуто указанное число одновременных загрузок, подтверждён корректный порт VPS и отрицательные контроли, и есть >=20 успешных скачиваний и HTTP ping. `budget_limited` означает завершение из-за лимита до таймера; `insufficient_samples` — слишком мало успешных ответов. Строки с этими статусами полезны как функциональная проверка, но НЕ сопоставимы как полноценный нагрузочный тест. p95 доступен только при >=20 успешных ответах, p99 — при >=100. Недоступные метрики указаны «—», а не нулём.
 
 ![Скорость (только подтверждённые полные интервалы)](charts/throughput.svg)
 
@@ -312,7 +347,8 @@ def generate(folder):
 CSV с первичными данными: measurements.csv, request-samples.csv, server-resources.csv.
 Файл negative-controls.json подтверждает, что DIRECT и заведомо неисправный SOCKS5
 не смогли получить удалённый origin. Для каждого уровня сохранены порт, число
-реально входящих IPv4-пакетов и их общий размер по IP на VPS, измеренный независимым
+реально входящих IPv4-пакетов **от того же внешнего IPv4, что управляющая SSH-сессия Android**,
+и их общий размер на VPS, измеренный независимым
 AF_PACKET-сборщиком (без полезной нагрузки и IP клиентов). Наличие входящих
 пакетов соответствующего порта и SHA256+nonce подтверждает маршрут гораздо сильнее,
 чем один лишь выбор профиля в API. При одновременном стороннем трафике на другие
@@ -367,6 +403,7 @@ CI-тесты и фрагментарные замеры за доказател
         seconds=meta.get("seconds_per_level", "—"),
         budget=meta.get("max_mib", "—"), ok=all_ok, count=all_requests,
         mib=total_bytes / (1024 * 1024), summary=summary,
+        parallel_summary=parallel_summary,
         details=details, limits=limits,
     )
     (folder / "report.md").write_text(document, encoding="utf-8")

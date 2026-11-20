@@ -4,6 +4,7 @@
 Run only for your own test server. No listener is exposed outside 127.0.0.1.
 """
 import argparse
+import ipaddress
 import json
 import os
 import pathlib
@@ -51,6 +52,15 @@ def read_state(root):
 def start(root, duration, size, capture=False):
     if not (5 <= duration <= 7200 and 1024 <= size <= 16 * 1024 * 1024):
         raise SystemExit("Неверная длительность или размер данных")
+    source_ip = None
+    if capture:
+        connection = os.environ.get("SSH_CONNECTION", "").split()
+        if len(connection) != 4:
+            raise SystemExit("Нет SSH_CONNECTION: нельзя привязать пакеты к телефону")
+        try:
+            source_ip = str(ipaddress.IPv4Address(connection[0]))
+        except ipaddress.AddressValueError:
+            raise SystemExit("Счётчик VPS требует IPv4 SSH-клиента")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     if (root / "session.json").exists():
@@ -93,7 +103,7 @@ def start(root, duration, size, capture=False):
         observer = subprocess.Popen(
             [sys.executable, str(here / "port_capture.py"),
              "--output", str(root / "port-counters.json"),
-             "--duration", str(duration)],
+             "--duration", str(duration), "--source-ip", source_ip],
             stdin=subprocess.DEVNULL, stdout=capture_log,
             stderr=subprocess.STDOUT, start_new_session=True,
         )
@@ -153,7 +163,11 @@ def counters(root):
     path = root / 'port-counters.json'
     if not path.is_file():
         raise SystemExit('Нет счётчиков пакетов; вызовите start --capture')
-    print(path.read_text())
+    data = json.loads(path.read_text())
+    heartbeat = data.get("updated_monotonic")
+    if not isinstance(heartbeat, (int, float)) or time.monotonic() - heartbeat > 2.0:
+        data["active"] = False  # fail closed when observer stopped unexpectedly
+    print(json.dumps(data))
 
 
 def main():

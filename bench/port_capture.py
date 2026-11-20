@@ -24,9 +24,11 @@ PORTS = {
 ETH_P_IP = 0x0800
 
 
-def parse_ingress_ipv4(data):
+def parse_ingress_ipv4(data, source_bytes=None):
     """Return (port/protocol, IPv4 total bytes) for a TCP/UDP destination."""
     if len(data) < 20 or data[0] >> 4 != 4:
+        return None
+    if source_bytes is not None and data[12:16] != source_bytes:
         return None
     header_length = (data[0] & 15) * 4
     if header_length < 20 or len(data) < header_length + 4:
@@ -49,8 +51,10 @@ def parse_ingress_ipv4(data):
 
 def port_evidence(before, after, expected):
     """Independent ingress observation; fail closed when counters go backwards."""
-    if not (before.get("available") and after.get("available")):
-        raise RuntimeError("Счётчик пакетов VPS недоступен")
+    if not (before.get("available") and after.get("available")
+            and before.get("active") and after.get("active")
+            and before.get("source_filtered") and after.get("source_filtered")):
+        raise RuntimeError("Счётчик пакетов VPS недоступен, завершён или не привязан к IP телефона")
     a, b = before.get("counters", {}), after.get("counters", {})
     delta = {}
     for port in b:
@@ -73,6 +77,8 @@ def port_evidence(before, after, expected):
 
 
 def save_state(path, payload):
+    # VPS monotonic heartbeat lets independent SSH snapshots detect dead capture.
+    payload["updated_monotonic"] = time.monotonic()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".port-counter-", dir=path.parent)
     try:
@@ -87,9 +93,11 @@ def save_state(path, payload):
             os.unlink(name)
 
 
-def record(out, duration, interval):
+def record(out, duration, interval, source_ip):
+    source_bytes = socket.inet_aton(source_ip)
     counters = {key: {"packets": 0, "ip_bytes": 0} for key in sorted(PORTS)}
-    state = {"available": False, "reason": "initializing", "counters": counters}
+    state = {"available": False, "active": False, "source_filtered": True,
+             "reason": "initializing", "counters": counters}
     try:
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM,
                              socket.htons(ETH_P_IP))
@@ -97,7 +105,7 @@ def record(out, duration, interval):
     except (OSError, AttributeError) as exc:
         save_state(out, {**state, "reason": f"AF_PACKET: {type(exc).__name__}"})
         return 2
-    state.update(available=True, reason="")
+    state.update(available=True, active=True, reason="")
     deadline = time.monotonic() + duration
     next_write = time.monotonic()
     try:
@@ -115,7 +123,7 @@ def record(out, duration, interval):
                     # Linux PACKET_HOST == 0; ignore outgoing and other-host packets.
                     if len(address) < 3 or address[2] != socket.PACKET_HOST:
                         continue
-                    parsed = parse_ingress_ipv4(data)
+                    parsed = parse_ingress_ipv4(data, source_bytes)
                     if parsed:
                         key, size = parsed
                         counters[key]["packets"] += 1
@@ -124,6 +132,7 @@ def record(out, duration, interval):
                 save_state(out, state)
                 next_write = time.monotonic() + interval
     finally:
+        state["active"] = False
         save_state(out, state)
         sock.close()
     return 0
@@ -134,10 +143,17 @@ def main():
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--duration", type=float, required=True)
     ap.add_argument("--interval", type=float, default=.2)
+    ap.add_argument("--source-ip", required=True, help="IPv4 SSH-клиента, не сохраняется")
     a = ap.parse_args()
     if not (1 <= a.duration <= 7200 and .05 <= a.interval <= 5):
         ap.error("invalid duration or polling interval")
-    return record(a.output, a.duration, a.interval)
+    try:
+        socket.inet_aton(a.source_ip)
+        import ipaddress
+        source = str(ipaddress.IPv4Address(a.source_ip))
+    except (OSError, ValueError):
+        ap.error("--source-ip должен быть IPv4 SSH-клиента")
+    return record(a.output, a.duration, a.interval, source)
 
 
 if __name__ == "__main__":

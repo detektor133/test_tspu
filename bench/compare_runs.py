@@ -63,7 +63,8 @@ def combine(folders, output):
             table.append("| " + " | ".join(columns) + " |")
     # Для графика выбираем только совместимый уровень параллельности,
     # предпочтительно 8. Отсутствующие успешные измерения не сравниваем.
-    methodologies = {(m.get('seconds_per_level'), m.get('payload_bytes'))
+    methodologies = {(m.get('seconds_per_level'), m.get('payload_bytes'),
+                      m.get('ping_interval_seconds'), tuple(m.get('levels') or []))
                      for m in metadata.values()}
     compatible = len(methodologies) == 1
     shared = set.intersection(*[
@@ -91,7 +92,8 @@ def combine(folders, output):
         "успешными ответами (статус ok и подтверждённая длительность). "
         "Старые CSV без метаданных, раннее исчерпание бюджета и малая выборка "
         "показаны как несопоставимые. Для графика требуется одинаковая длительность "
-        "и размер ответа. Мобильный сигнал, маршрут и часы испытаний могли отличаться."
+        "и размер ответа, набор ступеней и частота HTTP ping. "
+        "Мобильный сигнал, маршрут и часы испытаний могли отличаться."
     )
     entries = "\n".join(
         "- %s: UTC %s; телефон %s; ошибки запуска: %s" %

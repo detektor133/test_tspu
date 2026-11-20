@@ -155,8 +155,8 @@ def run(a):
         levels = [int(v.strip()) for v in a.levels.split(",")]
     except ValueError:
         raise SystemExit("--levels: целые числа через запятую")
-    if not levels or len(levels) > 6 or any(not 1 <= n <= 64 for n in levels):
-        raise SystemExit("--levels: 1..6 уровней от 1 до 64 потоков")
+    if not levels or len(levels) > 7 or any(not 1 <= n <= 64 for n in levels) or len(set(levels)) != len(levels):
+        raise SystemExit("--levels: 1..7 уникальных уровней от 1 до 64 потоков")
     subscribed, sub_host = subscription()
     if sub_host != server_ip:
         raise SystemExit("Адрес подписки и --vps различаются. Не тестируйте другой сервер.")
@@ -178,11 +178,12 @@ def run(a):
     # Каждый запрошенный уровень должен иметь шанс задействовать ВСЕ потоки.
     # Иначе ранние протоколы съедят бюджет, а тесты в 32/64 потока превратятся
     # в фиктивные тесты с 1-2 реальными запросами.
-    total_requests = (a.max_mib * 1024 * 1024) // 262144
+    payload_bytes = a.payload_kib * 1024
+    total_requests = (a.max_mib * 1024 * 1024) // payload_bytes
     min_requests = len(nodes) * sum(levels)
     if total_requests < min_requests:
         import math
-        needed = math.ceil(min_requests * 262144 / (1024 * 1024))
+        needed = math.ceil(min_requests * payload_bytes / (1024 * 1024))
         raise SystemExit(
             "Недостаточно лимита для проверки всех профилей на заданных уровнях. "
             "Требуется --max-mib не меньше %d либо уменьшите --levels." % needed)
@@ -232,7 +233,7 @@ def run(a):
     samples = []
     controls = {"DIRECT": "not_run", "BROKEN_SOCKS5": "not_run"}
     remote_error = ""
-    budget = int(a.max_mib * 1024 * 1024 // 262144)
+    budget = total_requests
     future_levels = [level for _, label in PORTS if label in nodes for level in levels]
     started_at = now()
     try:
@@ -241,7 +242,8 @@ def run(a):
             remote_scp(a.ssh_port, ROOT / name, dest + ":" + remote + "/" + name)
         response = run_ssh(dest, a.ssh_port,
                            "python3 " + remote + "/vps_session.py start --dir " + remote
-                           + " --duration " + str(secs) + " --size 262144 --capture", timeout=30)
+                           + " --duration " + str(secs) + " --size " + str(payload_bytes)
+                           + " --capture", timeout=30)
         info = json.loads(response)
         started_session = True
         expected = info["sha256"]
@@ -272,8 +274,8 @@ def run(a):
             api("PUT", "/proxies/FIELD", ctrl_secret, {"name": control})
             if api("GET", "/proxies/FIELD", ctrl_secret).get("now") != control:
                 raise RuntimeError("Невозможно выбрать отрицательный контроль " + label)
-            probe = request_once(target, proxy, min(3, a.timeout), 262144,
-                                 expected, 262144, verify_nonce=True)
+            probe = request_once(target, proxy, min(3, a.timeout), payload_bytes,
+                                 expected, payload_bytes, verify_nonce=True)
             if probe[0]:
                 controls[label] = "unexpected_success"
                 raise RuntimeError("КРИТИЧЕСКАЯ ОШИБКА: " + label
@@ -314,7 +316,7 @@ def run(a):
                 level_samples = []
                 measurement = run_level(
                     target, proxy, level, a.seconds, a.timeout,
-                    262144, expected, 262144, max_requests=quota,
+                    payload_bytes, expected, payload_bytes, max_requests=quota,
                     on_sample=lambda r: level_samples.append({"kind": "download", **r}),
                     on_ping_sample=lambda r: level_samples.append({"kind": "ping", **r}),
                     ping_target=ping_target, ping_interval=1.0, verify_nonce=True)
@@ -333,6 +335,8 @@ def run(a):
                     quality = "failed"
                 elif route["route_status"] != "verified":
                     quality = "route_" + route["route_status"]
+                elif measurement["peak_inflight"] < level:
+                    quality = "underfilled_concurrency"
                 elif measurement["measurement_status"] == "budget_limited":
                     quality = "budget_limited"
                 elif measurement["latency_samples"] < 20:
@@ -346,7 +350,8 @@ def run(a):
                        "error": "", "date_utc": started_at, "started_utc": t0,
                        "ended_utc": t1, "label": a.network + " / " + label,
                        "concurrency": level, "seconds_configured": a.seconds,
-                       "cumulative_mib": round((a.max_mib * 4 - budget) / 4, 2),
+                       "cumulative_mib": round((total_requests - budget)
+                                               * payload_bytes / (1024 ** 2), 2),
                        "protocol_cumulative_mib": round(protocol_bytes_ok / (1024 ** 2), 2),
                        **route, **measurement}
                 rows.append(row)
@@ -395,7 +400,7 @@ def run(a):
                     "protocols_expected": [label for _, label in PORTS],
                     "profiles_found": len(nodes), "levels": levels,
                     "seconds_per_level": a.seconds, "max_mib": a.max_mib,
-                    "payload_bytes": 262144, "ping_interval_seconds": 1,
+                    "payload_bytes": payload_bytes, "ping_interval_seconds": 1,
                     "min_p95_samples": 20,
                     "min_p99_samples": 100,
                     "route_evidence": "VPS AF_PACKET ingress ports",
@@ -429,6 +434,8 @@ def main():
     run_p.add_argument("--ssh-user", default="root")
     run_p.add_argument("--ssh-port", type=int, default=22)
     run_p.add_argument("--levels", default="1,8,32,64")
+    run_p.add_argument("--payload-kib", type=int, default=256, choices=(64, 128, 256, 512, 1024, 2048, 4096),
+                       help="размер случайной HTTP-нагрузки одного запроса, КиБ (64..4096)")
     run_p.add_argument("--seconds", type=float, default=6)
     run_p.add_argument("--timeout", type=float, default=10)
     run_p.add_argument("--max-mib", type=int, default=256,

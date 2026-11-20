@@ -4,6 +4,7 @@ import csv
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import socket
 from pathlib import Path
 import secrets
 import struct
@@ -66,10 +67,12 @@ class TestFieldReport(unittest.TestCase):
             "seconds_configured": 6, "seconds_elapsed": 6.03,
             "latency_samples": 25, "requests_ok": 25,
             "app_rtt_samples": 25, "app_rtt_p95_ms": 123.0,
+            "concurrency": 4, "peak_inflight": 4,
             "route_status": "verified", "route_packets": 45,
             "raw_samples_complete": True, "controls_passed": True
         }
         self.assertTrue(valid_level(row))
+        self.assertFalse(valid_level({**row, "peak_inflight": 3}))
         self.assertFalse(valid_level({**row, "route_packets": 0}))
         self.assertFalse(valid_level({**row, "route_status": "ambiguous"}))
         self.assertFalse(valid_level({**row, "raw_samples_complete": False}))
@@ -80,6 +83,15 @@ class TestFieldReport(unittest.TestCase):
         self.assertFalse(valid_level({**row, "app_rtt_p95_ms": ""}))
         self.assertFalse(valid_level({**row, "measurement_status": "budget_limited"}))
         self.assertFalse(valid_level({**row, "measurement_status": ""}))
+
+    def test_capture_requires_proven_ssh_source_ip(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "session"
+            with mock.patch.dict("os.environ", {"SSH_CONNECTION": ""}):
+                with self.assertRaises(SystemExit):
+                    vps_session.start(path, duration=6, size=2048, capture=True)
+            self.assertFalse(path.exists())
 
     def test_raw_ingress_port_parser(self):
         def packet(protocol, port):
@@ -96,27 +108,33 @@ class TestFieldReport(unittest.TestCase):
         self.assertIsNone(parse_ingress_ipv4(packet(17, 443)))  # TCP-only
         self.assertIsNone(parse_ingress_ipv4(packet(6, 54321)))
         self.assertIsNone(parse_ingress_ipv4(b"wrong"))
+        self.assertIsNone(parse_ingress_ipv4(packet(6, 8388), socket.inet_aton("1.2.3.4")))
+        self.assertEqual(parse_ingress_ipv4(packet(6, 8388), bytes(4)), ("8388/tcp", 40))
         fragment = bytearray(packet(6, 8388))
         fragment[6:8] = struct.pack("!H", 1)
         self.assertIsNone(parse_ingress_ipv4(fragment))
 
     def test_port_evidence_rejects_missing_or_contaminated_port(self):
-        empty = {"available": True, "counters": {
+        empty = {"available": True, "active": True, "source_filtered": True, "counters": {
             "8388/tcp": {"packets": 0, "ip_bytes": 0},
             "443/tcp": {"packets": 0, "ip_bytes": 0}}}
-        good = {"available": True, "counters": {
+        good = {"available": True, "active": True, "source_filtered": True, "counters": {
             "8388/tcp": {"packets": 50, "ip_bytes": 4300},
             "443/tcp": {"packets": 0, "ip_bytes": 0}}}
         result = port_evidence(empty, good, "8388/tcp")
         self.assertEqual(result["route_status"], "verified")
         self.assertEqual(result["route_packets"], 50)
         self.assertEqual(port_evidence(empty, good, "443/tcp")["route_status"], "no_ingress")
-        noisy = {"available": True, "counters": {
+        noisy = {"available": True, "active": True, "source_filtered": True, "counters": {
             "8388/tcp": {"packets": 50, "ip_bytes": 4300},
             "443/tcp": {"packets": 1, "ip_bytes": 60}}}
         self.assertEqual(port_evidence(empty, noisy, "8388/tcp")["route_status"], "ambiguous")
         with self.assertRaises(RuntimeError):
             port_evidence(good, empty, "8388/tcp")
+        with self.assertRaises(RuntimeError):
+            port_evidence({**empty, "source_filtered": False}, good, "8388/tcp")
+        with self.assertRaises(RuntimeError):
+            port_evidence(empty, {**good, "active": False}, "8388/tcp")
 
     def test_raw_samples_cannot_be_forged_as_valid_benchmark(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -129,6 +147,7 @@ class TestFieldReport(unittest.TestCase):
                 "bytes_ok": 20 * 1024, "latency_samples": 20,
                 "app_rtt_samples": 20, "app_rtt_failed": 0,
                 "app_rtt_p95_ms": 98,
+                "concurrency": 4, "peak_inflight": 4,
                 "route_status": "verified", "route_packets": 100
             }]
             self.assertFalse(attach_evidence(root, rows))
@@ -147,6 +166,17 @@ class TestFieldReport(unittest.TestCase):
                     writer.writerow({"protocol": "Hysteria2", "concurrency": 4,
                                      "kind": "ping", "ok": 1, "bytes_ok": 0,
                                      "nonce": ("%024x" % (i + 100))})
+            self.assertTrue(attach_evidence(root, rows))
+            self.assertTrue(valid_level(rows[0]))
+            # Duplicate nonce and malformed sample kinds must invalidate the run.
+            with (root / "request-samples.csv").open("r+") as f:
+                original = f.read()
+                f.seek(0)
+                f.write(original.replace("000000000000000000000001", "000000000000000000000000"))
+                f.truncate()
+            self.assertTrue(attach_evidence(root, rows))
+            self.assertFalse(valid_level(rows[0]))
+            (root / "request-samples.csv").write_text(original)
             self.assertTrue(attach_evidence(root, rows))
             self.assertTrue(valid_level(rows[0]))
             rows[0]["bytes_ok"] = 999

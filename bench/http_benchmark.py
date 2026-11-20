@@ -27,6 +27,7 @@ HEADERS = [
     'latency_p50_ms', 'latency_p95_ms', 'latency_p99_ms',
     'measurement_status', 'duration_coverage_pct', 'latency_samples',
     'app_rtt_samples', 'app_rtt_failed', 'app_rtt_p50_ms', 'app_rtt_p95_ms',
+    'peak_inflight',
 ]
 
 
@@ -124,6 +125,8 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
     started = time.monotonic()
     deadline = started + seconds
     reserved = 0
+    active = 0
+    peak_active = 0
     budget_limited = False
     app_ping = []
     stop_ping = threading.Event()
@@ -147,7 +150,7 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
             stop_ping.wait(min(ping_interval, max(0.0, deadline - time.monotonic())))
 
     def worker():
-        nonlocal reserved, budget_limited
+        nonlocal reserved, budget_limited, active, peak_active
         batch = []
         while time.monotonic() < deadline:
             with lock:
@@ -157,9 +160,15 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
                         budget_limited = True
                     break
                 reserved += 1
-            result = request_once(target, proxy, timeout, min_bytes, expected_sha256,
-                                  max_bytes, verify_nonce=verify_nonce)
-            batch.append(result)
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                result = request_once(target, proxy, timeout, min_bytes, expected_sha256,
+                                      max_bytes, verify_nonce=verify_nonce)
+                batch.append(result)
+            finally:
+                with lock:
+                    active -= 1
             if on_sample is not None:
                 on_sample({
                     "started_utc": result[6], "ended_utc": result[7],
@@ -181,10 +190,12 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
             for task in tasks:
                 task.result()
     finally:
+        # Measuring download throughput must NOT include waiting for a
+        # separate in-flight ping after all download workers have finished.
+        wall = time.monotonic() - started
         stop_ping.set()
         if pinger is not None:
             pinger.join()  # A request is timeout-bounded; never leak into next profile.
-    wall = time.monotonic() - started
     ok = [r for r in completed if r[0]]
     ping_ok = [r for r in app_ping if r[0]]
     first_byte = [r[2] for r in ok]
@@ -205,6 +216,7 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
         'measurement_status': 'budget_limited' if budget_limited else 'time_completed',
         'duration_coverage_pct': round(min(100.0, wall / seconds * 100), 1),
         'latency_samples': len(ok),
+        'peak_inflight': peak_active,
         'app_rtt_samples': len(ping_ok),
         'app_rtt_failed': len(app_ping) - len(ping_ok),
         'app_rtt_p50_ms': (round(percentile([r[3] for r in ping_ok], .5), 2)
