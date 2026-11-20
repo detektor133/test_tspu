@@ -18,10 +18,12 @@ trap cleanup EXIT
 
 fatal() {
   echo "E2E: $*" >&2
-  if [[ -s "$ROOT/client.log" ]]; then
-    echo 'Последние ошибки клиентского ядра:' >&2
-    grep -Ei 'error|warn|fail' "$ROOT/client.log" | tail -18 >&2 || true
-  fi
+  for logfile in "$ROOT/validate.log" "$ROOT/client.log"; do
+    if [[ -s "$logfile" ]]; then
+      echo 'Ошибки конфигурации/ядра:' >&2
+      grep -Ei 'error|warn|fail|panic|invalid' "$logfile" | tail -18 >&2 || true
+    fi
+  done
   exit 1
 }
 
