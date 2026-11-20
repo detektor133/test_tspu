@@ -75,11 +75,47 @@ assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "8.8.8.8"
 assert_eq "$(sudo cat /var/lib/test-tspu/cert-mode)" "custom"
 check_https 8.8.8.8
 
-log "Повторный деплой не должен сбрасывать GUI или запрашивать ACME"
+log "Повторный деплой: отсутствие изменений и прежний PID"
+pid_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
+sysctl_before="$(sudo stat -c %Y /etc/sysctl.d/90-test-tspu.conf)"
+unit_before="$(sudo stat -c %Y /etc/systemd/system/m-ui.service.d/90-test-tspu.conf)"
 run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/repeat.log" 2>&1 || { cat "$TMP/repeat.log"; exit 1; }
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "8.8.8.8"
 sudo systemctl is-active --quiet m-ui.service
+assert_eq "$(sudo systemctl show -p MainPID --value m-ui.service)" "$pid_before"
+assert_eq "$(sudo stat -c %Y /etc/sysctl.d/90-test-tspu.conf)" "$sysctl_before"
+assert_eq "$(sudo stat -c %Y /etc/systemd/system/m-ui.service.d/90-test-tspu.conf)" "$unit_before"
+grep -q 'Итог: без изменений' "$TMP/repeat.log"
 check_https 8.8.8.8
+
+log "Восстановление удалённой конфигурации без переустановки"
+sudo rm /etc/systemd/system/m-ui.service.d/90-test-tspu.conf
+run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/reconcile.log" 2>&1 || { cat "$TMP/reconcile.log"; exit 1; }
+assert_file /etc/systemd/system/m-ui.service.d/90-test-tspu.conf
+grep -q 'Изменено: /etc/systemd/system/m-ui.service.d/90-test-tspu.conf' "$TMP/reconcile.log"
+check_https 8.8.8.8
+
+log "Восстановление повреждённого бинарника ядра (без смены настроек панели)"
+sudo install -m 0755 /usr/bin/true /usr/local/m-ui/mihomo.stale
+sudo mv -f /usr/local/m-ui/mihomo.stale /usr/local/m-ui/mihomo
+run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/repair-core.log" 2>&1 || { cat "$TMP/repair-core.log"; exit 1; }
+sudo /usr/local/m-ui/mihomo -v | grep -Fq 'v1.19.34'
+grep -q 'Изменено: Mihomo' "$TMP/repair-core.log"
+check_https 8.8.8.8
+
+log "Восстановление устаревшей версии панели с сохранением аккаунта и HTTPS"
+sudo install -m 0755 /usr/bin/true /usr/local/m-ui/m-ui.stale
+sudo mv -f /usr/local/m-ui/m-ui.stale /usr/local/m-ui/m-ui
+run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/repair-panel.log" 2>&1 || { cat "$TMP/repair-panel.log"; exit 1; }
+sudo /usr/local/m-ui/m-ui version | grep -Fq 'v0.3.3'
+grep -q 'Изменено: m-ui' "$TMP/repair-panel.log"
+check_https 8.8.8.8
+
+log "После обновлений повторный запуск опять ничего не меняет"
+pid_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
+run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/post-upgrade-noop.log" 2>&1 || { cat "$TMP/post-upgrade-noop.log"; exit 1; }
+assert_eq "$(sudo systemctl show -p MainPID --value m-ui.service)" "$pid_before"
+grep -q 'Итог: без изменений' "$TMP/post-upgrade-noop.log"
 
 log "Смена IP с новым сертификатом"
 run_root bash deploy.sh --ip 1.1.1.1 --cert-file "$TMP/ip-b.pem" \
