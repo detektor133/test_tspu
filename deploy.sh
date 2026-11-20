@@ -720,7 +720,7 @@ if not dest.exists() or dest.read_text().strip() != user:
     dest.write_text(user + '\n')
     dest.chmod(0o600)
 
-existing = api('GET', 'api/inbounds')
+existing = api('GET', 'api/inbounds') or []
 if not isinstance(existing, list):
     raise SystemExit('m-ui вернула неожиданный список inbounds')
 names = {item.get('name') for item in existing}
