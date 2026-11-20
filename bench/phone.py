@@ -287,6 +287,20 @@ def run(a):
         from urllib.parse import urlsplit
         target = urlsplit("http://127.0.0.1:18180/payload")
         proxy = urlsplit("http://127.0.0.1:17890")
+        # NEGATIVE CONTROLS: a direct call and a definitely broken outbound
+        # MUST NOT download the origin. This catches bypasses/fallbacks.
+        for label, control in (("DIRECT", "DIRECT"), ("BROKEN_SOCKS5", broken)):
+            api("PUT", "/proxies/FIELD", ctrl_secret, {"name": control})
+            if api("GET", "/proxies/FIELD", ctrl_secret).get("now") != control:
+                raise RuntimeError("Невозможно выбрать отрицательный контроль " + label)
+            probe = request_once(target, proxy, min(3, a.timeout), 262144,
+                                 expected, 262144, verify_nonce=True)
+            if probe[0]:
+                controls[label] = "unexpected_success"
+                raise RuntimeError("КРИТИЧЕСКАЯ ОШИБКА: " + label
+                                   + " смог получить origin. Тест маршрутизации недостоверен!")
+            controls[label] = "failed_as_expected"
+            print("Отрицательный контроль " + label + ": отказ подтверждён", flush=True)
         for port, label in PORTS:
             node = nodes.get(label)
             if not node:
@@ -315,14 +329,27 @@ def run(a):
                 spare = max(0, budget - required_later - level)
                 quota = level + spare // (len(future_levels) + 1)
                 quota = min(quota, budget - required_later)
+                before = vps_counters(dest, a.ssh_port, remote)
                 t0 = now()
-                measurement = run_level(target, proxy, level, a.seconds, a.timeout,
-                                        262144, expected, 262144, max_requests=quota)
+                level_samples = []
+                measurement = run_level(
+                    target, proxy, level, a.seconds, a.timeout,
+                    262144, expected, 262144, max_requests=quota,
+                    on_sample=level_samples.append, verify_nonce=True)
                 t1 = now()
+                # Packet recorder flushes counters periodically (200 ms).
+                time.sleep(.3)
+                after = vps_counters(dest, a.ssh_port, remote)
+                route = port_evidence(before, after, str(port) + "/" + TRANSPORT[label])
+                for record in level_samples:
+                    samples.append({"network": a.network, "protocol": label,
+                                    "concurrency": level, **record})
                 budget -= measurement["requests_total"]
                 # Functional success is not automatically a valid sustained benchmark.
                 if not measurement["requests_ok"]:
                     quality = "failed"
+                elif route["route_status"] != "verified":
+                    quality = "route_" + route["route_status"]
                 elif measurement["measurement_status"] == "budget_limited":
                     quality = "budget_limited"
                 elif measurement["latency_samples"] < 20:
@@ -333,14 +360,17 @@ def run(a):
                        "proxy_name": name, "status": quality,
                        "error": "", "date_utc": started_at, "started_utc": t0,
                        "ended_utc": t1, "label": a.network + " / " + label,
-                       "concurrency": level, "seconds_configured": a.seconds, **measurement}
+                       "concurrency": level, "seconds_configured": a.seconds,
+                       "cumulative_mib": round((a.max_mib * 4 - budget) / 4, 2),
+                       **route, **measurement}
                 rows.append(row)
                 p95 = ("%.0f мс" % row["latency_p95_ms"]
                        if row["latency_p95_ms"] != "" else "н/д (<20 успешных ответов)")
-                print("%s | %2d потоков | %d/%d OK | %.2f МиБ/с | %.2f/%.2f с | %s | p95 %s" %
+                print("%s | %2d потоков | %d/%d OK | %.2f МиБ/с | %.2f/%.2f с | %s | "
+                      "порт %s: %d входящих пакетов | p95 %s" %
                       (label, level, row["requests_ok"], row["requests_total"],
                        row["throughput_mib_s"], row["seconds_elapsed"], a.seconds,
-                       quality, p95), flush=True)
+                       quality, route["route_port"], route["route_packets"], p95), flush=True)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
         remote_error = "%s: %s" % (type(exc).__name__, str(exc)[:180])
         print("Ошибка теста: " + remote_error, file=sys.stderr)
@@ -359,6 +389,12 @@ def run(a):
                            output / "server-resources.csv")
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 remote_error += " Монитор VPS недоступен: " + type(exc).__name__
+        (output / "negative-controls.json").write_text(
+            json.dumps(controls, ensure_ascii=False, indent=2))
+        with (output / "request-samples.csv").open("w", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=SAMPLE_FIELDS)
+            writer.writeheader()
+            writer.writerows(samples)
         with (output / "measurements.csv").open("w", newline="") as fp:
             writer = csv.DictWriter(fp, fieldnames=CSV_FIELDS)
             writer.writeheader()
@@ -371,15 +407,20 @@ def run(a):
                     "profiles_found": len(nodes), "levels": levels,
                     "seconds_per_level": a.seconds, "max_mib": a.max_mib,
                     "payload_bytes": 262144, "min_p95_samples": 20,
-                    "min_p99_samples": 100, "error": remote_error}
+                    "min_p99_samples": 100,
+                    "route_evidence": "VPS AF_PACKET ingress ports",
+                    "negative_controls": controls,
+                    "error": remote_error}
         (output / "environment.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
         from generate_report import generate
         generate(output)
         print("Отчёт: " + str(output / "report.md"))
         print("CSV: " + str(output / "measurements.csv"))
+        print("Сырые запросы: " + str(output / "request-samples.csv"))
+        print("Контроли: " + str(output / "negative-controls.json"))
         print("CPU/RAM: " + str(output / "server-resources.csv"))
         print("Секретный private-mihomo.yaml остаётся ТОЛЬКО в приватном каталоге телефона.")
-        if any(row.get("status") in ("budget_limited", "insufficient_samples") for row in rows):
+        if any(row.get("status") != "ok" for row in rows):
             print("ВНИМАНИЕ: часть уровней — пробные/недостаточные измерения. "
                   "Для сравнимого бенчмарка увеличьте --seconds и --max-mib; "
                   "см. статусы и фактическое время в отчёте.")
