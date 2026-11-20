@@ -155,7 +155,11 @@ assert_eq "$(sudo systemctl show -p MainPID --value m-ui.service)" "$pid_before"
 assert_eq "$(sudo sha256sum /var/lib/test-tspu/subscriptions.txt | awk '{print $1}')" "$subscriptions_before"
 assert_eq "$(sudo stat -c %Y /etc/sysctl.d/90-test-tspu.conf)" "$sysctl_before"
 assert_eq "$(sudo stat -c %Y /etc/systemd/system/m-ui.service.d/90-test-tspu.conf)" "$unit_before"
-grep -q 'Итог: без изменений' "$TMP/repeat.log"
+if ! grep -q 'Итог: без изменений' "$TMP/repeat.log"; then
+  echo 'Повторный запуск сделал неожиданные изменения:' >&2
+  grep -E '^\[test-tspu\]' "$TMP/repeat.log" | tail -30 >&2 || true
+  exit 1
+fi
 check_https 8.8.8.8
 
 log "Восстановление удалённой конфигурации без переустановки"
@@ -169,7 +173,7 @@ log "Восстановление повреждённого бинарника 
 sudo install -m 0755 /usr/bin/true /usr/local/m-ui/mihomo.stale
 sudo mv -f /usr/local/m-ui/mihomo.stale /usr/local/m-ui/mihomo
 run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/repair-core.log" 2>&1 || { cat "$TMP/repair-core.log"; exit 1; }
-sudo /usr/local/m-ui/mihomo -v | grep -Fq 'v1.19.34'
+[[ "$(sudo /usr/local/m-ui/mihomo -v)" == *v1.19.34* ]]
 grep -q 'Изменено: Mihomo' "$TMP/repair-core.log"
 check_https 8.8.8.8
 
