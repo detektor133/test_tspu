@@ -26,6 +26,7 @@ HEADERS = [
     'bytes_ok', 'throughput_mib_s', 'ttfb_p50_ms', 'ttfb_p95_ms',
     'latency_p50_ms', 'latency_p95_ms', 'latency_p99_ms',
     'measurement_status', 'duration_coverage_pct', 'latency_samples',
+    'app_rtt_samples', 'app_rtt_failed', 'app_rtt_p50_ms', 'app_rtt_p95_ms',
 ]
 
 
@@ -116,13 +117,34 @@ def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes,
 
 
 def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha256, max_bytes,
-              max_requests=None, on_sample=None, verify_nonce=False):
+              max_requests=None, on_sample=None, verify_nonce=False,
+              ping_target=None, on_ping_sample=None, ping_interval=1.0):
     completed = []
     lock = threading.Lock()
     started = time.monotonic()
     deadline = started + seconds
     reserved = 0
     budget_limited = False
+    app_ping = []
+    stop_ping = threading.Event()
+
+    def ping_worker():
+        # Small HTTP request-response through the SAME selected VPN while
+        # download workers saturate it. This is application-level RTT,
+        # NOT ICMP RTT; it includes connection/stream setup and forwarding.
+        while not stop_ping.is_set() and time.monotonic() < deadline:
+            result = request_once(ping_target, proxy, min(timeout, 6), 0, None, 0,
+                                  verify_nonce=True)
+            app_ping.append(result)
+            if on_ping_sample is not None:
+                on_ping_sample({
+                    "started_utc": result[6], "ended_utc": result[7],
+                    "ok": int(result[0]), "bytes_ok": 0,
+                    "ttfb_ms": round(result[2], 2) if result[0] else "",
+                    "latency_ms": round(result[3], 2),
+                    "error_type": result[4], "nonce": result[5],
+                })
+            stop_ping.wait(min(ping_interval, max(0.0, deadline - time.monotonic())))
 
     def worker():
         nonlocal reserved, budget_limited
@@ -149,12 +171,22 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
         with lock:
             completed.extend(batch)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        tasks = [executor.submit(worker) for _ in range(threads)]
-        for task in tasks:
-            task.result()
+    pinger = None
+    if ping_target is not None:
+        pinger = threading.Thread(target=ping_worker, daemon=True)
+        pinger.start()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            tasks = [executor.submit(worker) for _ in range(threads)]
+            for task in tasks:
+                task.result()
+    finally:
+        stop_ping.set()
+        if pinger is not None:
+            pinger.join()  # A request is timeout-bounded; never leak into next profile.
     wall = time.monotonic() - started
     ok = [r for r in completed if r[0]]
+    ping_ok = [r for r in app_ping if r[0]]
     first_byte = [r[2] for r in ok]
     full_latency = [r[3] for r in ok]
     return {
@@ -173,6 +205,12 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
         'measurement_status': 'budget_limited' if budget_limited else 'time_completed',
         'duration_coverage_pct': round(min(100.0, wall / seconds * 100), 1),
         'latency_samples': len(ok),
+        'app_rtt_samples': len(ping_ok),
+        'app_rtt_failed': len(app_ping) - len(ping_ok),
+        'app_rtt_p50_ms': (round(percentile([r[3] for r in ping_ok], .5), 2)
+                           if ping_ok else ''),
+        'app_rtt_p95_ms': percentile_or_missing([r[3] for r in ping_ok],
+                                               .95, MIN_P95_SAMPLES),
     }
 
 
