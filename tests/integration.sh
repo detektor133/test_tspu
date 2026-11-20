@@ -94,7 +94,19 @@ for port in 8388 9443 10443 11443; do
     if sudo ss -ltn | grep -Eq ":${port}[[:space:]]"; then found=1; break; fi
     sleep 0.2
   done
-  ((found)) || { echo "TCP $port не слушает после ожидания" >&2; sudo ss -lntup; exit 1; }
+  if ((!found)); then
+    echo "TCP $port не слушает после ожидания" >&2
+    sudo ss -lntup
+    sudo grep -E '^[[:space:]]*(name|type|port|certificate|private-key):' /usr/local/m-ui/data/config.yaml | tail -90 || true
+    # m-ui сохраняет логи ядра в памяти. Показываем только diagnostic строки.
+    panel_path="$(sudo python3 -c 'import json; print("/"+json.load(open("/usr/local/m-ui/data/state.json"))["settings"]["panelPath"].strip("/")+"/")')"
+    sudo curl -sS --noproxy '*' --cacert "$TMP/ca.pem" \
+      --resolve '8.8.8.8:2053:127.0.0.1' \
+      --cookie /var/lib/test-tspu/api-session.cookies \
+      "https://8.8.8.8:2053${panel_path}api/core/logs" |
+      python3 -c 'import json,sys; x=json.load(sys.stdin); print(str(x.get("data"))[-2400:])' || true
+    exit 1
+  fi
 done
 
 log "Повторный деплой: отсутствие изменений и прежний PID"
