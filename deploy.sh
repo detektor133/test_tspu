@@ -345,7 +345,6 @@ CORE_PATH='/usr/local/m-ui/mihomo'
 PANEL_PATH='/usr/local/m-ui/m-ui'
 PANEL_DATA='/usr/local/m-ui/data'
 CORE_UPDATED=0
-PANEL_UPDATED=0
 PANEL_BOOTSTRAP=0
 mkdir -p /usr/local/m-ui
 
@@ -423,7 +422,6 @@ if ((NEED_PANEL)); then
       fail 'не удалось обновить m-ui; проверьте резервную копию в data/backups'
     fi
   fi
-  PANEL_UPDATED=1
   change "m-ui → $PANEL_VERSION"
 fi
 [[ "$("$CORE_PATH" -v 2>/dev/null)" == *"$CORE_VERSION"* ]] || fail 'после установки версия Mihomo неверная'
@@ -571,7 +569,7 @@ fi
 # а не просто ответ на 127.0.0.1 с --insecure.
 TLS_CURL_ARGS=()
 if [[ -n "$CA_CERT_FILE" ]]; then TLS_CURL_ARGS=(--cacert "$CA_CERT_FILE"); fi
-if ! curl "${TLS_CURL_ARGS[@]}" --noproxy '*' -sS --connect-timeout 5 --max-time 10 --resolve "${TARGET_HOST}:${PANEL_PORT}:127.0.0.1" "https://${TARGET_HOST}:${PANEL_PORT}/" -o /dev/null; then
+if ! curl "${TLS_CURL_ARGS[@]}" --noproxy '*' -sS --retry 6 --retry-connrefused --retry-delay 1 --connect-timeout 3 --max-time 3 --resolve "${TARGET_HOST}:${PANEL_PORT}:127.0.0.1" "https://${TARGET_HOST}:${PANEL_PORT}/" -o /dev/null; then
   fail "HTTPS на ${TARGET_HOST}:${PANEL_PORT} не прошёл проверку. Проверьте TLS и DNS."
 fi
 log "Готово: https://${TARGET_HOST}:${PANEL_PORT}/"
@@ -579,4 +577,9 @@ log 'Путь, логин и пароль выведены установщик�
 log 'Откройте во внешнем firewall TCP 80 (сертификаты) и TCP 2053 (GUI).'
 log 'Для изменения IP можно повторить установку с --ip АДРЕС или дождаться проверки по таймеру.'
 log 'Клиентские подключения и их порты создаются отдельно в GUI.'
+if ((CHANGED == 0)); then
+  log 'Итог: без изменений, работающие службы не перезапускались'
+else
+  log "Итог: применено изменений: $CHANGED"
+fi
 status
