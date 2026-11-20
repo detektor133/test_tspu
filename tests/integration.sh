@@ -43,12 +43,11 @@ sudo update-ca-certificates >/dev/null
 
 check_https() {
   local host="$1" code path
-  # m-ui печатает установленный путь админки в journal при запуске.
-  path="$(sudo journalctl -u m-ui -o cat --no-pager |
-    grep -oE 'https://0[.]0[.]0[.]0:2053/[[:alnum:]]+/' |
-    tail -n 1 | sed 's#https://0.0.0.0:2053##')"
-  [[ -n "$path" ]] || { echo "Не найден реальный путь панели в journalctl" >&2; exit 1; }
-  code="$(curl -sS -L --max-redirs 3 --noproxy '*' --cacert "$TMP/ca.pem" \
+  # Источник истины — state.json: в journalctl запись может появиться с задержкой.
+  path="$(sudo /usr/bin/python3 -c 'import json; s=json.load(open("/usr/local/m-ui/data/state.json")); print("/"+s["settings"]["panelPath"].strip("/")+"/")')"
+  [[ -n "$path" ]] || { echo "Не найден путь панели" >&2; exit 1; }
+  code="$(curl -sS -L --retry 5 --retry-connrefused --retry-delay 1 \
+    --max-redirs 3 --noproxy '*' --cacert "$TMP/ca.pem" \
     --connect-timeout 3 --max-time 8 \
     --resolve "$host:2053:127.0.0.1" \
     -o "$TMP/panel.html" -w '%{http_code}' "https://$host:2053$path")"
