@@ -91,7 +91,7 @@ sudo stat -c %a /var/lib/test-tspu/inbound-secrets.json | grep -qx 600
 for port in 8388 9443 10443 11443; do
   found=0
   for attempt in {1..25}; do
-    if sudo ss -ltn | grep -Eq ":$port[[:space:]]"; then found=1; break; fi
+    if sudo ss -ltn | grep -Eq ":${port}[[:space:]]"; then found=1; break; fi
     sleep 0.2
   done
   ((found)) || { echo "TCP $port не слушает после ожидания" >&2; sudo ss -lntup; exit 1; }
