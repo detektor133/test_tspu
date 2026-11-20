@@ -374,7 +374,7 @@ fi
 
 log 'Проверяю системные зависимости'
 missing_packages=()
-for dep in ca-certificates curl openssl gzip tar procps iproute2 kmod cron socat; do
+for dep in ca-certificates curl openssl gzip tar procps iproute2 kmod cron socat python3 util-linux; do
   if ! dpkg -s "$dep" >/dev/null 2>&1; then missing_packages+=("$dep"); fi
 done
 if ((${#missing_packages[@]})); then
