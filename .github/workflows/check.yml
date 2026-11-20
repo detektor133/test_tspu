@@ -27,6 +27,8 @@ jobs:
           bash -n deploy.sh
           bash -n tests/integration.sh
           bash -n tests/proxy-e2e.sh
+      - name: Проверка Python-скриптов измерений
+        run: python3 -m py_compile bench/*.py
       - name: ShellCheck
         run: shellcheck -S warning deploy.sh tests/integration.sh tests/proxy-e2e.sh
       - name: Проверка аргументов и диагностики
