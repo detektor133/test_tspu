@@ -23,6 +23,13 @@ INSTALLER_CACHE="${DATA_DIR}/m-ui-upstream-install.sh"
 HOST_FILE="${DATA_DIR}/panel-host"
 MODE_FILE="${DATA_DIR}/panel-mode"
 CERT_MODE_FILE="${DATA_DIR}/cert-mode"
+PUBLIC_MARK_FILE="${DATA_DIR}/panel-public"
+CUSTOM_CERT="${DATA_DIR}/custom-cert.pem"
+CUSTOM_KEY="${DATA_DIR}/custom-key.pem"
+CHANGED=0
+RESTART_REQUIRED=0
+
+change() { log "Изменено: $*"; CHANGED=$((CHANGED + 1)); }
 
 fail() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 log() { printf '[test-tspu] %s\n' "$*"; }
@@ -202,6 +209,22 @@ if [[ "$MODE" == check ]]; then status; exit 0; fi
 if [[ "$MODE" == rollback ]]; then rollback; exit 0; fi
 if [[ "$MODE" == sync-ip ]]; then sync_ip; exit 0; fi
 require_root
+mkdir -p "$DATA_DIR"
+chmod 0700 "$DATA_DIR"
+exec 9>"${DATA_DIR}/deploy.lock"
+flock -n 9 || fail 'другой деплой уже выполняется'
+TMP_DIR="$(mktemp -d)"
+cleanup() { rm -rf -- "$TMP_DIR"; }
+trap cleanup EXIT
+
+write_if_changed() {
+  local src="$1" dest="$2" mode="${3:-0644}"
+  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then return 1; fi
+  install -m "$mode" "$src" "${dest}.new"
+  mv -f "${dest}.new" "$dest"
+  change "$dest"
+  return 0
+}
 
 [[ -r /etc/os-release ]] || fail 'не удалось определить ОС'
 # shellcheck disable=SC1091
@@ -223,8 +246,6 @@ if ((FIREWALL)); then
   ss -H -ltn "sport = :${SSH_PORT}" | grep -q . || fail "SSH не слушает порт ${SSH_PORT}, UFW включать небезопасно"
 fi
 
-mkdir -p "$DATA_DIR"
-chmod 0700 "$DATA_DIR"
 if [[ ! -f "${DATA_DIR}/before.txt" ]]; then
   {
     date -Is; uname -a
@@ -237,7 +258,7 @@ if [[ ! -f "${DATA_DIR}/before.txt" ]]; then
   done > "${DATA_DIR}/sysctl-before.values"
 fi
 
-log 'Устанавливаю системные зависимости'
+log 'Проверяю системные зависимости'
 missing_packages=()
 for dep in ca-certificates curl openssl gzip tar procps iproute2 kmod cron socat; do
   if ! dpkg -s "$dep" >/dev/null 2>&1; then missing_packages+=("$dep"); fi
@@ -245,6 +266,7 @@ done
 if ((${#missing_packages[@]})); then
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing_packages[@]}"
+  change "установлены пакеты: ${missing_packages[*]}"
 fi
 # Определяем внешний IP только после установки curl.
 get_target
@@ -263,13 +285,13 @@ if [[ "$TARGET_MODE" == domain && -z "$CERT_FILE" ]]; then
 fi
 
 
-log 'Применяю умеренные сетевые настройки; BBR — только при поддержке ядром'
+log 'Проверяю сетевые настройки (BBR и лимиты)'
 if [[ -f "$TUNING_FILE" ]] && ! grep -q '^# managed by test-tspu deploy.sh$' "$TUNING_FILE"; then
   fail "файл $TUNING_FILE уже существует и не принадлежит этому установщику"
 fi
 modprobe tcp_bbr 2>/dev/null || true
 TUNING="# managed by test-tspu deploy.sh
-# Conservative limits; measure performance before/after changes.
+# Параметры изменяются только при отличии от требуемых значений.
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 4096
 net.core.rmem_max = 8388608
@@ -277,17 +299,27 @@ net.core.wmem_max = 8388608"
 if sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
   TUNING+=$'\nnet.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr'
 else
-  log 'BBR ядром не поддерживается — алгоритм TCP не меняем'
+  log 'BBR недоступен: оставляю действующий алгоритм TCP'
 fi
-printf '%s\n' "$TUNING" > "$TUNING_FILE"
-chmod 0644 "$TUNING_FILE"
-if ! sysctl -p "$TUNING_FILE"; then
-  log 'ПРЕДУПРЕЖДЕНИЕ: некоторые sysctl не применились (ограничения VPS?)'
+printf '%s\n' "$TUNING" > "${TMP_DIR}/tuning.conf"
+TUNING_CHANGED=0
+if write_if_changed "${TMP_DIR}/tuning.conf" "$TUNING_FILE"; then TUNING_CHANGED=1; fi
+SYSCTL_DRIFT=0
+while IFS='=' read -r key value; do
+  key="${key//[[:space:]]/}"
+  value="${value//[[:space:]]/}"
+  [[ -n "$key" && "${key:0:1}" != '#' ]] || continue
+  if [[ "$(sysctl -n "$key" 2>/dev/null || true)" != "$value" ]]; then
+    SYSCTL_DRIFT=1
+    break
+  fi
+done < "${TMP_DIR}/tuning.conf"
+if ((TUNING_CHANGED || SYSCTL_DRIFT)); then
+  if ! sysctl -p "$TUNING_FILE"; then
+    log 'ПРЕДУПРЕЖДЕНИЕ: некоторые sysctl не применились (ограничения VPS)'
+  fi
+  if ((SYSCTL_DRIFT && !TUNING_CHANGED)); then change 'восстановлены текущие значения sysctl'; fi
 fi
-
-TMP_DIR="$(mktemp -d)"
-cleanup() { rm -rf -- "$TMP_DIR"; }
-trap cleanup EXIT
 
 download_verified() {
   local url="$1" sha="$2" dest="$3"
