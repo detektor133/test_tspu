@@ -263,6 +263,9 @@ run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
   --sync-ip --ip 1.1.1.1 >"$TMP/duckdns-noop.log"
 assert_eq "$(sudo cat "$TMP/duckdns.log" | wc -l)" "2"
 
+log "Повторная проверка всех прокси после смены IP DuckDNS"
+bash tests/proxy-e2e.sh example.duckdns.org "$TMP/ca.pem"
+
 log "Проверка отката сетевых настроек"
 run_root bash deploy.sh --rollback-tuning >"$TMP/rollback.log"
 [[ ! -e /etc/sysctl.d/90-test-tspu.conf ]]
