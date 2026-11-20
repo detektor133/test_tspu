@@ -47,7 +47,7 @@ check_https() {
     grep -oE 'https://0[.]0[.]0[.]0:2053/[[:alnum:]]+/' |
     tail -n 1 | sed 's#https://0.0.0.0:2053##')"
   [[ -n "$path" ]] || { echo "Не найден реальный путь панели в journalctl" >&2; exit 1; }
-  code="$(curl -sS --noproxy '*' --cacert "$TMP/ca.pem" \
+  code="$(curl -sS -L --max-redirs 3 --noproxy '*' --cacert "$TMP/ca.pem" \
     --connect-timeout 3 --max-time 8 \
     --resolve "$host:2053:127.0.0.1" \
     -o "$TMP/panel.html" -w '%{http_code}' "https://$host:2053$path")"
