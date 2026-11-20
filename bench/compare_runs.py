@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from generate_report import chart, ORDER, valid_level
+from generate_report import chart, ORDER, valid_level, attach_evidence
 
 
 def rows_in(path):
@@ -27,6 +27,7 @@ def combine(folders, output):
         if not label or label in datasets:
             raise SystemExit("У каждой серии должна быть своя метка сети")
         datasets[label] = rows_in(folder)
+        attach_evidence(folder, datasets[label])
         metadata[label] = info
     # Проверяем одинаковую методику. Не приводим разнородные уровни к
     # фиктивным общим цифрам: каждый факт показываем только в своей ячейке.
