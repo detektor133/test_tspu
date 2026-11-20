@@ -695,6 +695,8 @@ if (( !NO_INBOUNDS )); then
   [[ -n "$INBOUND_PANEL_USER" ]] || fail 'не удалось определить имя пользователя m-ui'
   export TARGET_HOST CA_CERT_FILE INBOUND_PANEL_USER INBOUND_PASS_FILE
   export INBOUND_SECRETS_FILE REALITY_TARGET
+  export API_COOKIE_FILE="${TMP_DIR}/api-session.cookies"
+  export INBOUNDS_COUNT_FILE="${TMP_DIR}/inbounds-created-count"
   if ! python3 - <<'PY'
 import base64
 import http.cookiejar
@@ -720,7 +722,7 @@ user = os.environ['INBOUND_PANEL_USER']
 password = pathlib.Path(os.environ['INBOUND_PASS_FILE']).read_text().strip()
 path = '/' + settings['panelPath'].strip('/') + '/'
 ca = os.environ.get('CA_CERT_FILE', '')
-cookies = str(DIR / 'api-session.cookies')
+cookies = os.environ['API_COOKIE_FILE']
 secret_file = pathlib.Path(os.environ['INBOUND_SECRETS_FILE'])
 sni_override = os.environ.get('REALITY_TARGET', '').strip()
 
@@ -948,10 +950,14 @@ if created_count or tls_changed:
     api('POST', 'api/core/restart')
     print(f'Mihomo: применено новых inbounds: {created_count}; TLS обновлён: {tls_changed}')
 # m-ui сохраняет inbounds в state, изменения применяются через API.
+pathlib.Path(os.environ['INBOUNDS_COUNT_FILE']).write_text(str(created_count))
 print('Готово: inbounds сохранены через m-ui API')
 PY
   then
     fail 'автоматическая настройка inbound завершилась ошибкой (проверьте вывод выше)'
+  fi
+  if [[ -s "$INBOUNDS_COUNT_FILE" ]] && (( $(cat "$INBOUNDS_COUNT_FILE") > 0 )); then
+    change "созданы новые inbound: $(cat "$INBOUNDS_COUNT_FILE")"
   fi
 fi
 
