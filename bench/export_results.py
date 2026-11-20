@@ -5,8 +5,9 @@ from pathlib import Path
 import shutil
 
 ALLOWED = ("report.md", "environment.json", "measurements.csv",
-           "request-samples.csv", "negative-controls.json",
-           "server-resources.csv", "charts/throughput.svg", "charts/latency.svg")
+           "request-samples.csv", "negative-controls.json", "time-windows.csv",
+           "server-resources.csv", "charts/throughput.svg", "charts/latency.svg",
+           "charts/time-windows.svg")
 
 
 def export(source, downloads):

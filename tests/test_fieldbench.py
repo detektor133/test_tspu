@@ -18,7 +18,9 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
-from generate_report import generate, valid_level, attach_evidence
+from generate_report import generate, valid_level, valid_rtt, attach_evidence
+from field_modes import (choose_mode, minimum_budget_mib, classify,
+                         windows_from_samples)
 from http_benchmark import HEADERS, run_level, percentile_or_missing
 from compare_runs import combine
 import vps_session
@@ -63,7 +65,7 @@ class TestFieldReport(unittest.TestCase):
 
     def test_valid_level_requires_complete_time_and_sufficient_sample(self):
         row = {
-            "status": "ok", "measurement_status": "time_completed",
+            "status": "ok", "mode": "load", "measurement_status": "time_completed",
             "seconds_configured": 6, "seconds_elapsed": 6.03,
             "latency_samples": 25, "requests_ok": 25,
             "app_rtt_samples": 25, "app_rtt_p95_ms": 123.0,
@@ -78,9 +80,13 @@ class TestFieldReport(unittest.TestCase):
         self.assertFalse(valid_level({**row, "raw_samples_complete": False}))
         self.assertFalse(valid_level({**row, "controls_passed": False}))
         self.assertFalse(valid_level({**row, "seconds_elapsed": 1.7}))
-        self.assertFalse(valid_level({**row, "latency_samples": 8}))
-        self.assertFalse(valid_level({**row, "app_rtt_samples": 8}))
-        self.assertFalse(valid_level({**row, "app_rtt_p95_ms": ""}))
+        self.assertTrue(valid_level({**row, "latency_samples": 8}))
+        self.assertTrue(valid_level({**row, "app_rtt_samples": 8}))
+        self.assertFalse(valid_rtt({**row, "app_rtt_samples": 8}))
+        self.assertTrue(valid_level({**row, "app_rtt_p95_ms": ""}))
+        self.assertFalse(valid_rtt({**row, "app_rtt_p95_ms": ""}))
+        self.assertTrue(valid_rtt(row))
+        self.assertFalse(valid_level({**row, "mode": "smoke"}))
         self.assertFalse(valid_level({**row, "measurement_status": "budget_limited"}))
         self.assertFalse(valid_level({**row, "measurement_status": ""}))
 
@@ -128,7 +134,13 @@ class TestFieldReport(unittest.TestCase):
         noisy = {"available": True, "active": True, "source_filtered": True, "counters": {
             "8388/tcp": {"packets": 50, "ip_bytes": 4300},
             "443/tcp": {"packets": 1, "ip_bytes": 60}}}
-        self.assertEqual(port_evidence(empty, noisy, "8388/tcp")["route_status"], "ambiguous")
+        self.assertEqual(port_evidence(empty, noisy, "8388/tcp")["route_status"], "verified_with_noise")
+        very_noisy = {"available": True, "active": True, "source_filtered": True,
+                      "counters": {
+                          "8388/tcp": {"packets": 50, "ip_bytes": 4300},
+                          "443/tcp": {"packets": 50, "ip_bytes": 3000}}}
+        self.assertEqual(port_evidence(empty, very_noisy, "8388/tcp")["route_status"],
+                         "ambiguous")
         with self.assertRaises(RuntimeError):
             port_evidence(good, empty, "8388/tcp")
         with self.assertRaises(RuntimeError):
@@ -141,7 +153,7 @@ class TestFieldReport(unittest.TestCase):
             root = Path(tmp)
             rows = [{
                 "protocol": "Hysteria2", "concurrency": 4,
-                "status": "ok", "measurement_status": "time_completed",
+                "status": "ok", "mode": "load", "measurement_status": "time_completed",
                 "seconds_configured": 6, "seconds_elapsed": 6.1,
                 "requests_ok": 20, "requests_total": 20,
                 "bytes_ok": 20 * 1024, "latency_samples": 20,
@@ -241,9 +253,9 @@ class TestFieldReport(unittest.TestCase):
             self.assertIn("Пробный/неполный прогон", report)
             self.assertIn("1.72/6.00", report)
             self.assertIn("budget_limited", report)
-            self.assertIn("исключены из графиков", report)
+            self.assertIn("исключены из сравнения", report)
             svg = (root / "charts/throughput.svg").read_text()
-            self.assertIn("0.00 МиБ/с", svg)
+            self.assertIn("Нет подтверждённых", svg)
 
     def test_compare_does_not_promote_short_runs_to_valid_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,7 +267,9 @@ class TestFieldReport(unittest.TestCase):
                 folders.append(folder)
                 (folder / "environment.json").write_text(json.dumps({
                     "network_label_user_declared": net, "seconds_per_level": 6,
-                    "payload_bytes": 262144
+                    "mode": "load", "levels": [4],
+                    "protocols_selected": ["Hysteria2"],
+                    "ping_interval_seconds": .2, "payload_bytes": 262144
                 }))
                 with (folder / "measurements.csv").open("w", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=["network", "protocol",
@@ -301,7 +315,7 @@ class TestFieldReport(unittest.TestCase):
             self.assertNotIn("успешно обходит ТСПУ", report)
             svg = (root / "charts/throughput.svg").read_text()
             self.assertIn("<svg", svg)
-            self.assertIn("VLESS REALITY", svg)
+            self.assertIn("Нет подтверждённых", svg)
 
     def test_real_loopback_origin_and_cpu_csv(self):
         root = Path("/tmp/test-tspu-field-" + secrets.token_hex(8))
@@ -334,6 +348,82 @@ class TestFieldReport(unittest.TestCase):
         finally:
             vps_session.stop(root)
             shutil.rmtree(root, ignore_errors=True)
+
+    def test_mode_defaults_and_selection(self):
+        available = ["VLESS REALITY", "VLESS XHTTP", "Hysteria2", "TUIC",
+                     "Shadowsocks", "Trojan", "AnyTLS"]
+        smoke = choose_mode("smoke", None, None, None, None, None, available)
+        self.assertEqual(smoke["protocols"], available)
+        self.assertEqual(smoke["levels"], [1])
+        self.assertIsNone(smoke["ping_interval"])
+        load = choose_mode("load", "reality,hy2,tuic", None, None,
+                           None, None, available)
+        self.assertEqual(load["seconds"], 60)
+        self.assertEqual(load["protocols"],
+                         ["VLESS REALITY", "Hysteria2", "TUIC"])
+        self.assertEqual(load["ping_interval"], .2)
+        self.assertEqual(choose_mode("soak", None, None, None, None,
+                                     None, available)["seconds"], 180)
+        with self.assertRaises(ValueError):
+            choose_mode("load", "reality,whatever", None, None, None, None, available)
+        with self.assertRaises(ValueError):
+            choose_mode("load", "reality", None, 6, None, None, available)
+        with self.assertRaises(ValueError):
+            choose_mode("soak", "reality", None, 20, None, None, available)
+        with self.assertRaises(ValueError):
+            choose_mode("load", "hy2,hy2", None, None, None, None, available)
+
+    def test_smoke_does_not_demand_20_http_pings(self):
+        measure = {"requests_ok": 3, "requests_failed": 0,
+                   "measurement_status": "budget_limited", "peak_inflight": 1,
+                   "success_rate_pct": 100}
+        route = {"route_status": "verified_with_noise"}
+        self.assertEqual(classify("smoke", measure, route, 1), "smoke_pass")
+        self.assertEqual(classify("load", measure, route, 1), "budget_limited")
+        self.assertEqual(classify("smoke", {**measure, "requests_failed": 1},
+                                  route, 1), "smoke_degraded")
+        self.assertEqual(classify("smoke", {**measure, "requests_ok": 0},
+                                  route, 1), "failed")
+        self.assertEqual(classify("smoke", measure,
+                                  {"route_status": "ambiguous"}, 1),
+                         "route_ambiguous")
+        self.assertEqual(minimum_budget_mib("smoke", 7, [1,2,4], 262144, 3), 18)
+        self.assertEqual(minimum_budget_mib("load", 3, [1,4,8,16], 262144), 60)
+
+    def test_load_failures_are_not_silenced(self):
+        measure = {"requests_ok": 94, "requests_failed": 6,
+                   "measurement_status": "time_completed", "peak_inflight": 8,
+                   "success_rate_pct": 94}
+        route = {"route_status": "verified"}
+        self.assertEqual(classify("load", measure, route, 8), "degraded")
+        self.assertEqual(classify("load",
+                         {**measure, "success_rate_pct": 96}, route, 8), "ok")
+        self.assertEqual(classify("load",
+                         {**measure, "peak_inflight": 3}, route, 8),
+                         "underfilled_concurrency")
+
+    def test_time_windows_are_derived_from_actual_raw_requests(self):
+        row = {"network": "sbermobile", "protocol": "Hysteria2",
+               "concurrency": 4, "started_utc": "2026-11-20T00:00:00+00:00",
+               "seconds_elapsed": 20}
+        samples = [
+            {"protocol": "Hysteria2", "concurrency": 4, "kind": "download",
+             "ok": 1, "bytes_ok": 1048576,
+             "ended_utc": "2026-11-20T00:00:03+00:00"},
+            {"protocol": "Hysteria2", "concurrency": 4, "kind": "download",
+             "ok": 0, "bytes_ok": 0,
+             "ended_utc": "2026-11-20T00:00:13+00:00"},
+            {"protocol": "Hysteria2", "concurrency": 4, "kind": "ping",
+             "ok": 1, "latency_ms": 100, "ended_utc": "2026-11-20T00:00:15+00:00"},
+        ]
+        result = windows_from_samples([row], samples, window_seconds=10)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["downloads_ok"], 1)
+        self.assertEqual(result[0]["throughput_mib_s"], .1)
+        self.assertEqual(result[1]["downloads_total"], 1)
+        self.assertEqual(result[1]["ping_ok"], 1)
+        self.assertEqual(result[1]["ping_median_ms"], 100)
+        self.assertEqual(result[1]["ping_p95_ms"], "")
 
     def test_vps_session_path_safety(self):
         with self.assertRaises(SystemExit):

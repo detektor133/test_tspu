@@ -28,6 +28,8 @@ except ImportError:
 from http_benchmark import HEADERS, run_level, request_once
 from generate_report import generate
 from port_capture import port_evidence
+from field_modes import (choose_mode, minimum_budget_mib, classify,
+                         windows_from_samples, WINDOW_FIELDS)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = Path.home() / ".config" / "test-tspu"
@@ -38,7 +40,7 @@ PORTS = [
     (14443, "Hysteria2"), (8443, "TUIC"), (8388, "Shadowsocks"),
     (9443, "Trojan"), (10443, "AnyTLS"),
 ]
-CSV_FIELDS = ["network", "protocol", "proxy_name", "status", "error",
+CSV_FIELDS = ["network", "protocol", "proxy_name", "status", "mode", "error",
               "route_status", "route_port", "route_packets", "route_ip_bytes",
               "unexpected_port_packets", "cumulative_mib", "protocol_cumulative_mib"] + HEADERS
 SAMPLE_FIELDS = ["network", "protocol", "concurrency", "kind",
@@ -149,14 +151,6 @@ def run(a):
         raise SystemExit("Нет Android Mihomo. Запустите bash bench/setup_termux.sh")
     if a.ssh_port < 1 or a.ssh_port > 65535 or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", a.ssh_user):
         raise SystemExit("Некорректные SSH-параметры")
-    if not (3 <= a.seconds <= 120 and 8 <= a.max_mib <= 4096):
-        raise SystemExit("--seconds 3..120, --max-mib 8..4096")
-    try:
-        levels = [int(v.strip()) for v in a.levels.split(",")]
-    except ValueError:
-        raise SystemExit("--levels: целые числа через запятую")
-    if not levels or len(levels) > 7 or any(not 1 <= n <= 64 for n in levels) or len(set(levels)) != len(levels):
-        raise SystemExit("--levels: 1..7 уникальных уровней от 1 до 64 потоков")
     subscribed, sub_host = subscription()
     if sub_host != server_ip:
         raise SystemExit("Адрес подписки и --vps различаются. Не тестируйте другой сервер.")
@@ -175,18 +169,31 @@ def run(a):
                 nodes[label] = node
     if not nodes:
         raise SystemExit("В подписке нет профилей для указанного VPS")
-    # Каждый запрошенный уровень должен иметь шанс задействовать ВСЕ потоки.
-    # Иначе ранние протоколы съедят бюджет, а тесты в 32/64 потока превратятся
-    # в фиктивные тесты с 1-2 реальными запросами.
+    if a.mode == "smoke" and a.protocols in (None, "all"):
+        missing = [name for _, name in PORTS if name not in nodes]
+        if missing:
+            raise SystemExit("Режим smoke/all требует все 7 профилей. "
+                             "Отсутствуют: " + ", ".join(missing))
+    try:
+        plan = choose_mode(a.mode, a.protocols, a.levels, a.seconds,
+                           a.max_mib, a.ping_interval,
+                           [label for _, label in PORTS if label in nodes])
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    levels = plan["levels"]
+    a.seconds = plan["seconds"]
+    a.max_mib = plan["max_mib"]
+    a.ping_interval = plan["ping_interval"]
+    chosen = set(plan["protocols"])
+    nodes = {label: node for label, node in nodes.items() if label in chosen}
     payload_bytes = a.payload_kib * 1024
     total_requests = (a.max_mib * 1024 * 1024) // payload_bytes
-    min_requests = len(nodes) * sum(levels)
-    if total_requests < min_requests:
-        import math
-        needed = math.ceil(min_requests * payload_bytes / (1024 * 1024))
-        raise SystemExit(
-            "Недостаточно лимита для проверки всех профилей на заданных уровнях. "
-            "Требуется --max-mib не меньше %d либо уменьшите --levels." % needed)
+    needed = minimum_budget_mib(a.mode, len(nodes), levels, payload_bytes,
+                                smoke_requests=a.smoke_requests)
+    if a.max_mib < needed:
+        raise SystemExit("Недостаточно трафика для выбранного режима: минимум "
+                         "%d МиБ, передано --max-mib %d. Уменьшите --levels "
+                         "или --protocols." % (needed, a.max_mib))
     names = [n["name"] for n in nodes.values()]
     if len(names) != len(set(names)):
         raise SystemExit("Одинаковые имена прокси: API не сможет выбирать их однозначно")
@@ -222,10 +229,16 @@ def run(a):
                          + str(conf))
     dest = a.ssh_user + "@" + server_ip
     remote = "/tmp/test-tspu-field-" + runid
-    secs = int(len(nodes) * len(levels) * (a.seconds + 15) + 180)
+    secs = int(len(nodes) * len(levels) * (a.seconds + a.timeout + 5) + 180)
     if secs > 7200:
         raise SystemExit("Слишком длинный тест для защитного таймера VPS")
     print("Сеть: " + a.network + " (метка указана вручную; проверьте Wi-Fi/мобильные данные)")
+    print("Режим: %s | протоколы: %s | уровни: %s | %.0f с/уровень | бюджет: %d МиБ"
+          % (a.mode, ", ".join(plan["protocols"]), levels, a.seconds, a.max_mib))
+    if a.mode == "smoke":
+        print("SMOKE: проверяем маршруты/контроли. p95 не рассчитывается и не требуется.")
+    else:
+        print("LOAD/SOAK: HTTP /ping под нагрузкой; p95 только при >=20 успешных пробах.")
     print("SSH — только управление VPS; тестовый трафик идёт с телефона через VPN.")
     started_session = False
     process = None
@@ -301,16 +314,29 @@ def run(a):
                     if future_levels and future_levels[0] == skipped:
                         future_levels.pop(0)
                 continue
+            # Give connections from the previous profile time to drain,
+            # without masking other-port activity in the packet evidence.
+            time.sleep(.4)
             for level in levels:
                 if not future_levels or future_levels[0] != level:
                     raise RuntimeError("Внутренняя ошибка распределения лимита по уровням")
                 future_levels.pop(0)
-                required_later = sum(future_levels)
-                # Минимум level запросов для текущего теста, плюс равная доля
-                # свободных запросов; будущие уровни гарантированно сохранят квоту.
-                spare = max(0, budget - required_later - level)
-                quota = level + spare // (len(future_levels) + 1)
-                quota = min(quota, budget - required_later)
+                min_level = (max(level, a.smoke_requests) if a.mode == "smoke"
+                             else max(level, 20))
+                required_later = sum(
+                    max(t, a.smoke_requests) if a.mode == "smoke" else max(t, 20)
+                    for t in future_levels)
+                if a.mode == "smoke":
+                    # An intentionally small, fixed functional test.
+                    quota = min_level
+                else:
+                    # Reserve a floor of attempts for future levels; redistribute
+                    # unused requests without starving late protocols.
+                    spare = max(0, budget - required_later - min_level)
+                    quota = min_level + spare // (len(future_levels) + 1)
+                    quota = min(quota, budget - required_later)
+                if quota < min_level:
+                    raise RuntimeError("Ошибка распределения бюджета, недоступен минимум")
                 before = vps_counters(dest, a.ssh_port, remote)
                 t0 = now()
                 level_samples = []
@@ -319,7 +345,9 @@ def run(a):
                     payload_bytes, expected, payload_bytes, max_requests=quota,
                     on_sample=lambda r: level_samples.append({"kind": "download", **r}),
                     on_ping_sample=lambda r: level_samples.append({"kind": "ping", **r}),
-                    ping_target=ping_target, ping_interval=1.0, verify_nonce=True)
+                    ping_target=ping_target if a.mode != "smoke" else None,
+                    ping_interval=a.ping_interval or 1.0,
+                    verify_nonce=True)
                 t1 = now()
                 # Packet recorder flushes counters periodically (200 ms).
                 time.sleep(.3)
@@ -330,24 +358,11 @@ def run(a):
                                     "concurrency": level, **record})
                 budget -= measurement["requests_total"]
                 protocol_bytes_ok += measurement["bytes_ok"]
-                # Functional success is not automatically a valid sustained benchmark.
-                if not measurement["requests_ok"]:
-                    quality = "failed"
-                elif route["route_status"] != "verified":
-                    quality = "route_" + route["route_status"]
-                elif measurement["peak_inflight"] < level:
-                    quality = "underfilled_concurrency"
-                elif measurement["measurement_status"] == "budget_limited":
-                    quality = "budget_limited"
-                elif measurement["latency_samples"] < 20:
-                    quality = "insufficient_samples"
-                elif measurement["app_rtt_samples"] < 20:
-                    quality = "insufficient_rtt_samples"
-                else:
-                    quality = "ok"
+                quality = classify(a.mode, measurement, route, level,
+                                   min_success_pct=a.min_success_pct)
                 row = {"network": a.network, "protocol": label,
                        "proxy_name": name, "status": quality,
-                       "error": "", "date_utc": started_at, "started_utc": t0,
+                       "mode": a.mode, "error": "", "date_utc": started_at, "started_utc": t0,
                        "ended_utc": t1, "label": a.network + " / " + label,
                        "concurrency": level, "seconds_configured": a.seconds,
                        "cumulative_mib": round((total_requests - budget)
@@ -355,16 +370,26 @@ def run(a):
                        "protocol_cumulative_mib": round(protocol_bytes_ok / (1024 ** 2), 2),
                        **route, **measurement}
                 rows.append(row)
-                p95 = ("%.0f мс" % row["latency_p95_ms"]
-                       if row["latency_p95_ms"] != "" else "н/д (<20 успешных ответов)")
-                app95 = (str(row["app_rtt_p95_ms"]) + " мс"
-                         if row["app_rtt_p95_ms"] != "" else "н/д (<20 ping)")
-                print("%s | %2d потоков | %d/%d OK | %.2f МиБ/с | %.2f/%.2f с | %s | "
-                      "порт %s: %d пакетов | ping p95 %s | загрузка p95 %s" %
-                      (label, level, row["requests_ok"], row["requests_total"],
-                       row["throughput_mib_s"], row["seconds_elapsed"], a.seconds,
-                       quality, route["route_port"], route["route_packets"], app95, p95),
-                      flush=True)
+                if a.mode == "smoke":
+                    print("%s | %d потоков | %d/%d OK | %s | %s: %d пакетов "
+                          "| SHA256 + nonce подтверждены для успешных ответов"
+                          % (label, level, row["requests_ok"], row["requests_total"],
+                             quality, row["route_port"], row["route_packets"]),
+                          flush=True)
+                else:
+                    ping95 = (str(row["app_rtt_p95_ms"]) + " мс"
+                              if row["app_rtt_p95_ms"] != "" else "н/д")
+                    ping50 = (str(row["app_rtt_p50_ms"]) + " мс"
+                              if row["app_rtt_p50_ms"] != "" else "н/д")
+                    print("%s | %d потоков (пик %d) | %d/%d OK | %.2f МиБ/с "
+                          "| %.2f/%.2f с | %s | %s: %d пакетов "
+                          "| HTTP ping p50 %s, p95 %s (n=%d, timeout=%d)"
+                          % (label, level, row["peak_inflight"], row["requests_ok"],
+                             row["requests_total"], row["throughput_mib_s"],
+                             row["seconds_elapsed"], a.seconds, quality,
+                             row["route_port"], row["route_packets"],
+                             ping50, ping95, row["app_rtt_samples"],
+                             row["app_rtt_failed"]), flush=True)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as exc:
         remote_error = "%s: %s" % (type(exc).__name__, str(exc)[:180])
         print("Ошибка теста: " + remote_error, file=sys.stderr)
@@ -389,6 +414,11 @@ def run(a):
             writer = csv.DictWriter(fp, fieldnames=SAMPLE_FIELDS)
             writer.writeheader()
             writer.writerows(samples)
+        windows = windows_from_samples(rows, samples, window_seconds=10)
+        with (output / "time-windows.csv").open("w", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=WINDOW_FIELDS)
+            writer.writeheader()
+            writer.writerows(windows)
         with (output / "measurements.csv").open("w", newline="") as fp:
             writer = csv.DictWriter(fp, fieldnames=CSV_FIELDS)
             writer.writeheader()
@@ -399,8 +429,10 @@ def run(a):
                                                      text=True, timeout=10).stdout.strip()[:130],
                     "protocols_expected": [label for _, label in PORTS],
                     "profiles_found": len(nodes), "levels": levels,
+                    "mode": a.mode, "protocols_selected": plan["protocols"],
+                    "min_success_pct": a.min_success_pct,
                     "seconds_per_level": a.seconds, "max_mib": a.max_mib,
-                    "payload_bytes": payload_bytes, "ping_interval_seconds": 1,
+                    "payload_bytes": payload_bytes, "ping_interval_seconds": a.ping_interval,
                     "min_p95_samples": 20,
                     "min_p99_samples": 100,
                     "route_evidence": "VPS AF_PACKET ingress ports",
@@ -412,13 +444,15 @@ def run(a):
         print("Отчёт: " + str(output / "report.md"))
         print("CSV: " + str(output / "measurements.csv"))
         print("Сырые запросы: " + str(output / "request-samples.csv"))
+        print("Интервалы деградации: " + str(output / "time-windows.csv"))
         print("Контроли: " + str(output / "negative-controls.json"))
         print("CPU/RAM: " + str(output / "server-resources.csv"))
         print("Секретный private-mihomo.yaml остаётся ТОЛЬКО в приватном каталоге телефона.")
-        if any(row.get("status") != "ok" for row in rows):
-            print("ВНИМАНИЕ: часть уровней — пробные/недостаточные измерения. "
-                  "Для сравнимого бенчмарка увеличьте --seconds и --max-mib; "
-                  "см. статусы и фактическое время в отчёте.")
+        if a.mode != "smoke" and any(row.get("status") != "ok" for row in rows):
+            print("ВНИМАНИЕ: не все нагрузочные уровни полные: проверьте статусы, "
+                  "бюджет и фактические секунды в отчёте.")
+        if a.mode == "smoke":
+            print("SMOKE завершён. Для нагрузочного тестирования используйте --mode load.")
         if remote_error or not any(int(row.get("requests_ok", 0)) > 0 for row in rows):
             raise SystemExit("Прогон неполный либо нет успешной передачи данных. "
                              "Отчёт сохраняет ошибки; исправьте их и повторите.")
@@ -428,23 +462,36 @@ def main():
     p = argparse.ArgumentParser(description="Полевые измерения с Android без USB-модема")
     sub = p.add_subparsers(dest="action", required=True)
     sub.add_parser("configure", help="однократно сохранить URL подписки без эха и shell history")
-    run_p = sub.add_parser("run", help="одним запуском проверить все профили")
+    run_p = sub.add_parser("run", help="полевые режимы smoke/load/soak")
+    run_p.add_argument("--mode", choices=("smoke", "load", "soak"), default="smoke",
+                       help="smoke — доступность; load — нагрузка; soak — устойчивая работа")
+    run_p.add_argument("--protocols", default=None,
+                       help="all либо reality,xhttp,hy2,tuic,ss,trojan,anytls")
+    run_p.add_argument("--smoke-requests", type=int, default=3,
+                       help="минимум попыток на smoke-ступень (1..8)")
+    run_p.add_argument("--ping-interval", type=float, default=None,
+                       help="интервал между окончаниями HTTP ping, сек")
+    run_p.add_argument("--min-success-pct", type=float, default=95,
+                       help="минимальный процент успешных загрузок в режиме load/soak")
     run_p.add_argument("--vps", required=True, help="IPv4 реального сервера")
     run_p.add_argument("--network", required=True, help="sbermobile или rostelecom; указывается вручную")
     run_p.add_argument("--ssh-user", default="root")
     run_p.add_argument("--ssh-port", type=int, default=22)
-    run_p.add_argument("--levels", default="1,8,32,64")
+    run_p.add_argument("--levels", default=None,
+                       help="значения 1..64, по умолчанию зависит от режима")
     run_p.add_argument("--payload-kib", type=int, default=256, choices=(64, 128, 256, 512, 1024, 2048, 4096),
                        help="размер случайной HTTP-нагрузки одного запроса, КиБ (64..4096)")
-    run_p.add_argument("--seconds", type=float, default=6)
+    run_p.add_argument("--seconds", type=float, default=None)
     run_p.add_argument("--timeout", type=float, default=10)
-    run_p.add_argument("--max-mib", type=int, default=256,
+    run_p.add_argument("--max-mib", type=int, default=None,
                        help="верхний предел полезной нагрузки в МиБ")
     run_p.add_argument("--output", help="приватный каталог для CSV/отчёта")
     a = p.parse_args()
     if a.action == "configure":
         configure()
     else:
+        if not 1 <= a.smoke_requests <= 8 or not 1 <= a.min_success_pct <= 100:
+            raise SystemExit("--smoke-requests 1..8, --min-success-pct 1..100")
         run(a)
 
 

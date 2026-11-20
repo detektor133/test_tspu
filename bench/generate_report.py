@@ -82,26 +82,32 @@ def attach_evidence(folder, rows):
 
 
 def valid_level(row):
-    """A full timed observation with enough responses for a p95 estimate.
+    """Validated sustained throughput; p95 quality is checked independently.
 
-    Legacy CSVs without timing/sample metadata must not masquerade as validated.
+    A completed interval with only a handful of HTTP downloads may still
+    provide factual throughput; it must not invent a latency percentile.
     """
     try:
         return (row.get("status") == "ok"
+                and row.get("mode") in ("load", "soak")
                 and row.get("measurement_status") == "time_completed"
                 and float(row.get("seconds_configured") or 0) > 0
                 and float(row.get("seconds_elapsed") or 0) >= float(row["seconds_configured"]) - .01
-                and int(float(row.get("latency_samples") or 0)) >= 20
                 and int(float(row.get("requests_ok") or 0)) >= 20
-                and int(float(row.get("app_rtt_samples") or 0)) >= 20
-                and row.get("app_rtt_p95_ms") not in ("", None)
                 and int(float(row.get("peak_inflight") or 0)) >= int(float(row.get("concurrency") or 0))
-                and row.get("route_status") == "verified"
+                and row.get("route_status") in ("verified", "verified_with_noise")
                 and int(float(row.get("route_packets") or 0)) > 0
                 and row.get("raw_samples_complete") is True
                 and row.get("controls_passed") is True)
     except (ValueError, TypeError, KeyError):
         return False
+
+
+def valid_rtt(row):
+    """p95 of under-load application ping; 20+ successes, separate from throughput."""
+    return (valid_level(row)
+            and int(num(row.get("app_rtt_samples"))) >= 20
+            and row.get("app_rtt_p95_ms") not in (None, ""))
 
 
 def metric(value, precision=1):
@@ -127,6 +133,7 @@ def resources_for(row, resources):
     if not points:
         return None
     return {
+        "mihomo_present": any(num(r.get("mihomo_count")) > 0 for r in points),
         "cpu_avg": statistics.mean(num(r["mihomo_cpu_pct"]) for r in points),
         "cpu_peak": max(num(r["mihomo_cpu_pct"]) for r in points),
         "rss_peak": max(num(r["mihomo_rss_mib"]) for r in points),
@@ -145,6 +152,10 @@ def chart(path, title, values, unit):
         '<rect width="100%" height="100%" fill="#fbfcfe"/>',
         '<text x="20" y="32" font-family="Arial,sans-serif" font-size="18" font-weight="bold" fill="#172554">%s</text>' % html.escape(title),
     ]
+    if not values:
+        parts.append('<text x="20" y="67" font-family="Arial,sans-serif" '
+                     'font-size="14" fill="#374151">Нет подтверждённых '
+                     'данных для этого показателя</text>')
     for n, (name, value) in enumerate(values):
         y = 53 + n * 45
         barwidth = int(value / maximum * 505)
@@ -174,6 +185,8 @@ def generate(folder):
     date = meta.get("date_utc") or "не установлена"
     server = meta.get("vps_ipv4") or "не указан"
     reported = []
+    mode = meta.get("mode", "legacy")
+    expected_protocols = meta.get("protocols_selected") or ORDER
     by_label = {}
     for label in ORDER:
         group = [r for r in rows if r.get("protocol") == label]
@@ -181,7 +194,7 @@ def generate(folder):
         by_label[label] = tested
         if not tested:
             reason = group[0].get("status", "не измерялся") if group else "не измерялся"
-            reported.append("| " + " | ".join([label] + ["—"] * 10 + [reason]) + " |")
+            reported.append("| " + " | ".join([label] + ["—"] * 11 + [reason]) + " |")
             continue
         for r in tested:
             res = resources_for(r, resources)
@@ -193,9 +206,12 @@ def generate(folder):
                 str(r.get("requests_total") or "0"),
                 metric(r.get("seconds_elapsed"), 2) + "/" +
                 metric(r.get("seconds_configured"), 2),
-                metric(r.get("throughput_mib_s"), 3),
-                metric(r.get("app_rtt_p95_ms")),
-                metric(r.get("latency_p95_ms")),
+                metric(r.get("throughput_mib_s"), 3) if mode != "smoke" else "не измеряется",
+                (metric(r.get("app_rtt_p50_ms")) + " / " +
+                 metric(r.get("app_rtt_p95_ms"))) if mode != "smoke" else "не измеряется",
+                (str(r.get("app_rtt_samples", 0)) + " / " +
+                 str(r.get("app_rtt_failed", 0))) if mode != "smoke" else "—",
+                metric(r.get("latency_p95_ms")) if mode != "smoke" else "не измеряется",
                 str(r.get("route_port") or "—") + " (" +
                 str(r.get("route_packets") or "0") + " пак.)",
                 metric(r.get("protocol_cumulative_mib"), 2),
@@ -210,19 +226,28 @@ def generate(folder):
     transferred = {label: sum(int(num(r.get("bytes_ok"))) for r in group)
                    for label, group in by_label.items()}
     good = [x for label in ORDER for x in by_label[label] if valid_level(x)]
-    quality_issues = [x for label in ORDER for x in by_label[label] if not valid_level(x)]
+    good_rtt = [x for x in good if valid_rtt(x)]
+    quality_issues = [x for label in expected_protocols for x in by_label[label]
+                      if not valid_level(x)]
     max_verified_parallel = {
         label: max((int(num(r.get("concurrency"))) for r in by_label[label]
-                    if valid_level(r) and resources_for(r, resources) is not None), default=0)
+                    if valid_level(r) and resources_for(r, resources) is not None
+                    and resources_for(r, resources)["mihomo_present"]), default=0)
         for label in ORDER
     }
-    throughput = [(label, max((num(r.get("throughput_mib_s")) for r in by_label[label]
-                               if valid_level(r)), default=0.0))
-                  for label in ORDER]
-    latency = [(label, min((num(r.get("app_rtt_p95_ms")) for r in by_label[label]
-                            if valid_level(r) and r.get("app_rtt_p95_ms") not in ('', None)), default=0.0))
-               for label in ORDER]
-    # Zero on a chart means "no successful observation" rather than a measured 0 ms.
+    # Each bar represents one protocol AT ONE concurrency level.
+    # Comparing maxima from unlike levels would quietly change the workload.
+    throughput = [
+        (label + " / " + str(r["concurrency"]) + " потоков",
+         num(r.get("throughput_mib_s")))
+        for label in expected_protocols for r in by_label[label] if valid_level(r)
+    ]
+    latency = [
+        (label + " / " + str(r["concurrency"]) + " потоков",
+         num(r.get("app_rtt_p95_ms")))
+        for label in expected_protocols for r in by_label[label] if valid_rtt(r)
+    ]
+    # Do not display fake zero-height bars for unavailable measurements.
     charts = folder / "charts"
     charts.mkdir(exist_ok=True)
     chart(charts / "throughput.svg", "Скорость: только полные интервалы и достаточно выборок", throughput, "МиБ/с")
@@ -230,23 +255,37 @@ def generate(folder):
     total_bytes = sum(transferred.values())
     all_requests = sum(totals.values())
     all_ok = sum(successful.values())
-    absent = [label for label in ORDER if totals[label] == 0]
+    absent = [label for label in expected_protocols if totals[label] == 0]
     notes = []
     if not rows:
         notes.append("Измерений нет: скрипт не успел создать ни одного результата.")
     if absent:
         notes.append("Не измерены или недоступны профили: " + ", ".join(absent) + ".")
-    if quality_issues:
-        notes.append("Часть уровней имеет статус budget_limited, insufficient_samples, failed, "
-                     "route_no_ingress, route_ambiguous или unverified_legacy: "
-                     "это проверка передачи данных, но не подтверждённый бенчмарк заданной длительности. "
-                     "Они исключены из графиков сравнимой скорости/задержки.")
+    if quality_issues and mode != "smoke":
+        notes.append("Часть нагрузочных ступеней не прошла критерии полного интервала, "
+                     "успешности или подтверждения маршрута. Они остаются в таблице, "
+                     "но исключены из сравнения устойчивой пропускной способности.")
+    if mode == "smoke":
+        notes.append("Режим smoke проверяет только доступность, отрицательные контроли "
+                     "и целостность. Скорость и p95 НЕ являются результатами нагрузочного "
+                     "исследования, поэтому графики не строятся.")
+    elif good and len(good_rtt) < len(good):
+        notes.append("На отдельных полных ступенях нет >=20 успешных HTTP ping. "
+                     "Пропускная способность подтверждена независимо; p95 остаётся "
+                     "«—», что не обнуляет скорость.")
     if not controls_passed:
         notes.append("ОТРИЦАТЕЛЬНЫЕ КОНТРОЛИ НЕ ПОДТВЕРЖДЕНЫ: данные нельзя считать "
                      "аудированным тестом выбранных маршрутов.")
+    if any(r.get("route_status") == "verified_with_noise" for r in rows):
+        notes.append("На некоторых ступенях были единичные пакеты других тестовых портов: "
+                     "они сохранены как предупреждение (verified_with_noise), не как "
+                     "автоматическое опровержение наблюдаемого правильного порта.")
     if not (folder / "request-samples.csv").is_file():
         notes.append("Нет сырых данных каждого запроса: старые результаты "
                      "не считаются валидированным бенчмарком.")
+    if resources and not any(num(r.get("mihomo_count")) > 0 for r in resources):
+        notes.append("ВНИМАНИЕ: монитор не обнаружил серверный Mihomo (mihomo_count=0); "
+                     "интерпретация CPU/RAM не подтверждена.")
     if not resources:
         notes.append("CPU/RAM на VPS отсутствуют: SSH-монитор не передал CSV.")
     elif good and not any(resources_for(r, resources) for r in good):
@@ -288,17 +327,49 @@ def generate(folder):
     summary = "\n".join("| %s | %d/%d | %.1f |" %
                         (label, successful[label], totals[label],
                          transferred[label] / (1024 * 1024))
-                        for label in ORDER)
+                        for label in expected_protocols)
     details = "\n".join(reported)
     limits = "\n".join("- " + note for note in notes)
-    expected_levels = len(ORDER) * len(meta.get("levels", []))
-    complete = (bool(expected_levels) and len(good) == expected_levels
-                and controls_passed and not absent and not meta.get("error")
-                and bool(resources) and all(resources_for(r, resources) is not None for r in good))
-    status = "Полноценный бенчмарк" if complete else "Пробный/неполный прогон"
+    expected_levels = len(expected_protocols) * len(meta.get("levels", []))
+    throughput_complete = (bool(expected_levels) and len(good) == expected_levels
+                           and controls_passed and not absent and not meta.get("error")
+                           and bool(resources)
+                           and all(resources_for(r, resources) is not None
+                                   and resources_for(r, resources)["mihomo_present"] for r in good))
+    complete = throughput_complete and len(good_rtt) == len(good)
+    smoke_success = (mode == "smoke" and bool(expected_levels)
+                     and not absent and not meta.get("error")
+                     and controls_passed
+                     and sum(r.get("status") in ("smoke_pass", "smoke_degraded")
+                             for group in by_label.values() for r in group) == expected_levels
+                     and all(int(num(r.get("route_packets"))) > 0 for label in expected_protocols
+                             for r in by_label[label]))
+    if mode == "smoke":
+        status = ("Проверка доступности выполнена" if smoke_success
+                  else "Проверка доступности неполная")
+    elif complete:
+        status = "Полный нагрузочный бенчмарк, включая p95"
+    elif throughput_complete:
+        status = "Нагрузочный бенчмарк: скорость подтверждена, p95 частично недоступен"
+    else:
+        status = "Пробный/неполный прогон"
+    windows = read_csv(folder / "time-windows.csv")
+    timeline_chart = ""
+    if mode == "soak" and windows:
+        timeline_points = [(str(w.get("protocol", "")) + " / " +
+                            str(w.get("concurrency", "")) + " потоков / " +
+                            str(w.get("window_start_sec", "?")) + " c",
+                            num(w.get("throughput_mib_s")))
+                           for w in windows]
+        chart(charts / "time-windows.svg",
+              "Наблюдаемая скорость по 10-секундным интервалам",
+              timeline_points, "МиБ/с")
+        timeline_chart = "![Динамика по интервалам](charts/time-windows.svg)"
     document = """# Автоматический отчёт о полевом тестировании AnyModel
 
 **Статус:** {status}.
+
+**Режим:** {mode}. Значения для smoke нельзя переносить на нагрузочный benchmark.
 
 ## Условия эксперимента
 
@@ -333,16 +404,27 @@ def generate(folder):
 |---|---:|---:|
 {summary}
 
-| Протокол | Потоки | OK/все | Факт/план, с | МиБ/с | HTTP ping p95, мс | Загрузка 256 КиБ p95, мс | Порт VPS (вх. пакеты) | Накоплено протоколом, МиБ | CPU Mihomo peak, % ядра | RSS peak, МиБ | Статус |
-|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
+| Протокол | Потоки | OK/все | Факт/план, с | МиБ/с | HTTP ping p50 / p95, мс | Ping OK / ошибки | Загрузка p95, мс | Порт VPS (вх. пакеты) | Накоплено, МиБ | CPU Mihomo peak, % ядра | RSS peak, МиБ | Статус |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
 {details}
 
 100% CPU = одно занятое логическое ядро; это не процент всех ядер VPS.
-Статус `ok` означает, что выдержана плановая длительность и реально достигнуто указанное число одновременных загрузок, подтверждён корректный порт VPS и отрицательные контроли, и есть >=20 успешных скачиваний и HTTP ping. `budget_limited` означает завершение из-за лимита до таймера; `insufficient_samples` — слишком мало успешных ответов. Строки с этими статусами полезны как функциональная проверка, но НЕ сопоставимы как полноценный нагрузочный тест. p95 доступен только при >=20 успешных ответах, p99 — при >=100. Недоступные метрики указаны «—», а не нулём.
+В режиме smoke статусы `smoke_pass` / `smoke_degraded` подтверждают доступность
+и не требуют p95. В режиме load/soak `ok` означает полный интервал,
+подтверждённую параллельность, проверенные ответы, >=20 успешных загрузок,
+минимальный процент успешности из параметров запуска (по умолчанию 95%), отрицательные контроли и подтверждение порта VPS.
+p95 HTTP /ping рассчитывается **отдельно** только при >=20 успешных пробах.
+При меньшей выборке это «—», но валидная скорость не исчезает. `budget_limited` означает завершение из-за лимита до таймера; `insufficient_samples` — слишком мало успешных ответов. Строки с этими статусами полезны как функциональная проверка, но НЕ сопоставимы как полноценный нагрузочный тест. p95 доступен только при >=20 успешных ответах, p99 — при >=100. Недоступные метрики указаны «—», а не нулём.
 
 ![Скорость (только подтверждённые полные интервалы)](charts/throughput.svg)
 
-![Задержка (только подтверждённые полные интервалы)](charts/latency.svg)
+![HTTP ping p95 (только при достаточном числе проб)](charts/latency.svg)
+
+{timeline_chart}
+
+Исходные временные окна (каждые 10 секунд): time-windows.csv.
+Скорость в окне привязана к моменту завершения запроса, а не к точному времени
+передачи каждого байта. Одно падение в окне не доказывает ТСПУ.
 
 CSV с первичными данными: measurements.csv, request-samples.csv, server-resources.csv.
 Файл negative-controls.json подтверждает, что DIRECT и заведомо неисправный SOCKS5
@@ -397,7 +479,8 @@ CI-тесты и фрагментарные замеры за доказател
 Этот документ создан автоматически из результатов, а не написан по
 предположительным числам. Для воспроизведения см. bench/README.md.
 """.format(
-        status=status, date=date, network=network, server=server,
+        status=status, mode=mode, timeline_chart=timeline_chart,
+        date=date, network=network, server=server,
         client=meta.get("client_version", "Mihomo")[:100],
         size=meta.get("payload_bytes", 0), levels=meta.get("levels", []),
         seconds=meta.get("seconds_per_level", "—"),
