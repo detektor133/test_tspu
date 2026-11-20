@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
@@ -58,3 +58,41 @@ jobs:
           sudo systemctl status m-ui --no-pager | grep -vE ' (GET|POST|PUT|DELETE) /' || true
           sudo journalctl -u m-ui -n 100 --no-pager | grep -vE ' (GET|POST|PUT|DELETE) /' || true
           sudo systemctl list-timers --all --no-pager | grep -E 'acme|test-tspu' || true
+
+  debian-integration:
+    name: Установка и HTTPS (debian-${ matrix.release })
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['12', '13']
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Debian ${${ matrix.release }} с systemd
+        shell: bash
+        run: |
+          docker build --quiet --build-arg DEBIAN_RELEASE=${${ matrix.release }} \
+            -f tests/Dockerfile.debian -t test-tspu-debian:ci .
+          docker run -d --name debian-integration --privileged \
+            --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            -v "$PWD:/workspace:ro" \
+            test-tspu-debian:ci
+          for attempt in {1..35}; do
+            if docker exec debian-integration systemctl list-units --no-pager >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec debian-integration bash /workspace/deploy.sh --check-os
+      - name: Реальный деплой + сквозные тесты в Debian (лимит 170 секунд)
+        shell: bash
+        run: docker exec -w /workspace debian-integration timeout -k 5s 170s bash tests/integration.sh
+      - name: Диагностика при ошибке
+        if: failure()
+        run: |
+          docker logs --tail 50 debian-integration 2>&1 | grep -vE ' (GET|POST|PUT|DELETE) /' || true
+      - name: Завершить контейнер
+        if: always()
+        run: docker rm -f debian-integration >/dev/null 2>&1 || true
