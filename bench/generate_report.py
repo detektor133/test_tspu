@@ -26,6 +26,42 @@ def num(value):
         return 0.0
 
 
+def attach_evidence(folder, rows):
+    """Reject rows whose packet proof, controls or raw request log is absent.
+
+    This intentionally does not upgrade legacy field CSVs on regeneration.
+    """
+    folder = Path(folder)
+    samples = read_csv(folder / "request-samples.csv")
+    controls_path = folder / "negative-controls.json"
+    try:
+        controls = json.loads(controls_path.read_text())
+        controls_passed = (controls.get("DIRECT") == "failed_as_expected"
+                           and controls.get("BROKEN_SOCKS5") == "failed_as_expected")
+    except (OSError, ValueError, AttributeError):
+        controls_passed = False
+    groups = {}
+    for sample in samples:
+        key = (sample.get("protocol"), str(sample.get("concurrency")))
+        groups.setdefault(key, []).append(sample)
+    for row in rows:
+        key = (row.get("protocol"), str(row.get("concurrency")))
+        part = groups.get(key, [])
+        try:
+            complete = (len(part) == int(row.get("requests_total") or 0)
+                        and len(part) > 0
+                        and sum(int(v.get("ok") or 0) for v in part) ==
+                            int(row.get("requests_ok") or 0)
+                        and sum(int(v.get("bytes_ok") or 0) for v in part) ==
+                            int(row.get("bytes_ok") or 0)
+                        and all(v.get("nonce") and len(v["nonce"]) == 24 for v in part))
+        except (TypeError, ValueError):
+            complete = False
+        row["raw_samples_complete"] = complete
+        row["controls_passed"] = controls_passed
+    return controls_passed
+
+
 def valid_level(row):
     """A full timed observation with enough responses for a p95 estimate.
 
@@ -37,7 +73,11 @@ def valid_level(row):
                 and float(row.get("seconds_configured") or 0) > 0
                 and float(row.get("seconds_elapsed") or 0) >= float(row["seconds_configured"]) - .01
                 and int(float(row.get("latency_samples") or 0)) >= 20
-                and int(float(row.get("requests_ok") or 0)) >= 20)
+                and int(float(row.get("requests_ok") or 0)) >= 20
+                and row.get("route_status") == "verified"
+                and int(float(row.get("route_packets") or 0)) > 0
+                and row.get("raw_samples_complete") is True
+                and row.get("controls_passed") is True)
     except (ValueError, TypeError, KeyError):
         return False
 
@@ -104,6 +144,7 @@ def cell(value, precision=1):
 def generate(folder):
     folder = Path(folder)
     rows = read_csv(folder / "measurements.csv")
+    controls_passed = attach_evidence(folder, rows)
     resources = read_csv(folder / "server-resources.csv")
     manifest_path = folder / "environment.json"
     meta = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
@@ -114,7 +155,7 @@ def generate(folder):
     by_label = {}
     for label in ORDER:
         group = [r for r in rows if r.get("protocol") == label]
-        tested = [r for r in group if r.get("status") in ("ok", "failed", "budget_limited", "insufficient_samples")]
+        tested = [r for r in group if r.get("concurrency") not in (None, "")]
         by_label[label] = tested
         if not tested:
             reason = group[0].get("status", "не измерялся") if group else "не измерялся"
@@ -161,10 +202,16 @@ def generate(folder):
     if absent:
         notes.append("Не измерены или недоступны профили: " + ", ".join(absent) + ".")
     if quality_issues:
-        notes.append("Часть уровней имеет статус budget_limited, insufficient_samples, failed "
-                     "или unverified_legacy (старый CSV без метаданных): "
+        notes.append("Часть уровней имеет статус budget_limited, insufficient_samples, failed, "
+                     "route_no_ingress, route_ambiguous или unverified_legacy: "
                      "это проверка передачи данных, но не подтверждённый бенчмарк заданной длительности. "
                      "Они исключены из графиков сравнимой скорости/задержки.")
+    if not controls_passed:
+        notes.append("ОТРИЦАТЕЛЬНЫЕ КОНТРОЛИ НЕ ПОДТВЕРЖДЕНЫ: данные нельзя считать "
+                     "аудированным тестом выбранных маршрутов.")
+    if not (folder / "request-samples.csv").is_file():
+        notes.append("Нет сырых данных каждого запроса: старые результаты "
+                     "не считаются валидированным бенчмарком.")
     if not resources:
         notes.append("CPU/RAM на VPS отсутствуют: SSH-монитор не передал CSV.")
     elif good and not any(resources_for(r, resources) for r in good):
@@ -179,6 +226,10 @@ def generate(folder):
         "не является устойчивой скоростью за заданные секунды.",
         "insufficient_samples: до конца таймера дошли, но получено меньше 20 успешных ответов; "
         "для p95 требуется >=20, для p99 >=100. Недостаточные процентили показаны как «—».",
+        "Пассивные счётчики порта VPS не аутентифицируют IP отправителя: при стороннем трафике "
+        "на тестовом порту требуется изолировать VPS или дополнительная проверка источника.",
+        "Поля cumulative_mib показывают накопленную полезную нагрузку прогонки; "
+        "один рост ошибок после порога НЕ доказывает срабатывание DPI без повторов.",
         "Использование Mihomo и на сервере, и на клиенте ограничивает переносимость результатов на иные реализации.",
         "Один тайм-аут или падение скорости не доказывает вмешательство ТСПУ. Для таких выводов нужны повторные испытания и контрольные сети.",
         "Байты учитываются для успешных HTTP-ответов; ошибочные подключения и заголовки дают дополнительный неучтённый трафик.",
@@ -191,7 +242,7 @@ def generate(folder):
     limits = "\n".join("- " + note for note in notes)
     expected_levels = len(ORDER) * len(meta.get("levels", []))
     complete = (bool(expected_levels) and len(good) == expected_levels
-                and not absent and not meta.get("error")
+                and controls_passed and not absent and not meta.get("error")
                 and bool(resources) and all(resources_for(r, resources) is not None for r in good))
     status = "Полноценный бенчмарк" if complete else "Пробный/неполный прогон"
     document = """# Автоматический отчёт о полевом тестировании AnyModel
@@ -232,7 +283,15 @@ def generate(folder):
 
 ![Задержка (только подтверждённые полные интервалы)](charts/latency.svg)
 
-CSV с первичными данными: measurements.csv, server-resources.csv.
+CSV с первичными данными: measurements.csv, request-samples.csv, server-resources.csv.
+Файл negative-controls.json подтверждает, что DIRECT и заведомо неисправный SOCKS5
+не смогли получить удалённый origin. Для каждого уровня сохранены порт, число
+реально входящих IPv4-пакетов и их общий размер по IP на VPS, измеренный независимым
+AF_PACKET-сборщиком (без полезной нагрузки и IP клиентов). Наличие входящих
+пакетов соответствующего порта и SHA256+nonce подтверждает маршрут гораздо сильнее,
+чем один лишь выбор профиля в API. При одновременном стороннем трафике на другие
+тестовые порты выставляется route_ambiguous: без изоляции VPS это нестрогое доказательство.
+Сырые записи каждого запроса — request-samples.csv; туда НЕ записаны пароли и URL подписок.
 В каждом уровне имеются started_utc/ended_utc для привязки метрик VPS.
 
 ## Инженерный выбор транспорта и гипотезы
