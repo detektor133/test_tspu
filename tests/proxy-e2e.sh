@@ -2,6 +2,8 @@
 # Настоящий клиент Mihomo подключается к запущенным inbound того же runner.
 # Публичный VPS не требуется; TLS проверяется через тестовый CA.
 set -Eeuo pipefail
+# shellcheck disable=SC2024
+# Логи пишутся пользователем runner, а Mihomo выполняется от root.
 umask 077
 
 HOST="${1:?укажите адрес тестового сервера}"
