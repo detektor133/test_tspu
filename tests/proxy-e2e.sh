@@ -201,4 +201,29 @@ for item in json.load(open(sys.argv[1])):
     print(str(item['port'])+'\t'+item['type']+'\t'+item['name'])
 PY
 )
+# Дымовой бенчмарк на одном runner: он проверяет КОД замеров,
+# но его производительность нельзя переносить на российские сети.
+head -c 131072 /dev/urandom > "$ROOT/origin/payload.bin"
+python3 bench/server_monitor.py --duration 2 --interval 0.5 \
+  --output "$ROOT/server-monitor.csv" > "$ROOT/monitor.log" 2>&1 &
+MONITOR_PID=$!
+python3 bench/http_benchmark.py \
+  --url 'http://127.0.0.1:18180/payload.bin' \
+  --proxy "http://127.0.0.1:${MIXED_PORT}" \
+  --levels 1,8 --seconds 0.6 --timeout 5 --min-bytes 131072 \
+  --label CI-loopback --output "$ROOT/benchmark.csv" ||
+  fatal 'бенчмарк не смог передать нагрузку через Mihomo'
+wait "$MONITOR_PID" || fatal 'монитор CPU/RAM завершился с ошибкой'
+python3 - "$ROOT/benchmark.csv" "$ROOT/server-monitor.csv" <<'PY'
+import csv, sys
+with open(sys.argv[1]) as file:
+    rows = list(csv.DictReader(file))
+assert len(rows) == 2
+assert all(int(row['requests_ok']) > 0 for row in rows)
+with open(sys.argv[2]) as file:
+    rows = list(csv.DictReader(file))
+assert len(rows) >= 2
+assert any(int(row['mihomo_count']) > 0 for row in rows)
+print('E2E OK: бенчмарк throughput/latency и монитор CPU/RSS')
+PY
 echo 'E2E OK: подписки, TLS, API и реальная передача данных'
