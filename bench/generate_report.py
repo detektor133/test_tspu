@@ -118,7 +118,7 @@ def generate(folder):
         by_label[label] = tested
         if not tested:
             reason = group[0].get("status", "не измерялся") if group else "не измерялся"
-            reported.append("| %s | — | — | — | — | — | — | — | — | %s |" % (label, reason))
+            reported.append("| %s | — | — | — | — | — | — | — | %s |" % (label, reason))
             continue
         for r in tested:
             res = resources_for(r, resources)
