@@ -18,8 +18,9 @@ jobs:
         run: |
           bash -n deploy.sh
           bash -n tests/integration.sh
+          bash -n tests/proxy-e2e.sh
       - name: ShellCheck
-        run: shellcheck -S warning deploy.sh tests/integration.sh
+        run: shellcheck -S warning deploy.sh tests/integration.sh tests/proxy-e2e.sh
       - name: Проверка аргументов и диагностики
         run: |
           bash deploy.sh --help
@@ -35,6 +36,8 @@ jobs:
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
+      - name: Установить YAML-парсер для проверки клиентских профилей
+        run: sudo apt-get install -y -qq python3-yaml
       - name: Реальный деплой + интеграционные проверки (лимит 170 секунд)
         shell: bash
         run: timeout -k 5s 170s bash tests/integration.sh
