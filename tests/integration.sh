@@ -41,13 +41,19 @@ sudo install -m 0644 "$TMP/ca.pem" /usr/local/share/ca-certificates/test-tspu-ci
 sudo update-ca-certificates >/dev/null
 
 check_https() {
-  local host="$1" code
+  local host="$1" code path
+  # m-ui печатает установленный путь админки в journal при запуске.
+  path="$(sudo journalctl -u m-ui -o cat --no-pager |
+    grep -oE 'https://0[.]0[.]0[.]0:2053/[[:alnum:]]+/' |
+    tail -n 1 | sed 's#https://0.0.0.0:2053##')"
+  [[ -n "$path" ]] || { echo "Не найден реальный путь панели в journalctl" >&2; exit 1; }
   code="$(curl -sS --noproxy '*' --cacert "$TMP/ca.pem" \
     --connect-timeout 3 --max-time 8 \
     --resolve "$host:2053:127.0.0.1" \
-    -o /dev/null -w '%{http_code}' "https://$host:2053/")"
-  [[ "$code" =~ ^[234][0-9][0-9]$ ]] || { echo "Некорректный HTTPS-ответ: $code" >&2; exit 1; }
-  log "HTTPS $host:2053 отвечает (HTTP $code), сертификат доверенный"
+    -o "$TMP/panel.html" -w '%{http_code}' "https://$host:2053$path")"
+  [[ "$code" == 200 ]] || { echo "Страница панели вернула HTTP $code" >&2; exit 1; }
+  [[ -s "$TMP/panel.html" ]] || { echo "Пустая страница входа" >&2; exit 1; }
+  log "GUI $host:2053$path возвращает HTTP 200, TLS-сертификат доверенный"
 }
 
 log "Запуск настоящего деплоя: Mihomo, m-ui, systemd и TLS"
