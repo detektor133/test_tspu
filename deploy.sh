@@ -711,6 +711,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 DIR = pathlib.Path('/var/lib/test-tspu')
@@ -742,8 +743,13 @@ def api(method, endpoint, payload=None):
     argv.append(url)
     if payload is not None:
         argv.extend(['--data-binary', '@-'])
-    result = subprocess.run(argv, input=json.dumps(payload) if payload is not None else None,
-                            capture_output=True, text=True, timeout=16)
+    for attempt in range(12 if endpoint == 'api/auth/login' else 1):
+        result = subprocess.run(argv, input=json.dumps(payload) if payload is not None else None,
+                                capture_output=True, text=True, timeout=16)
+        if result.returncode == 0 or result.returncode == 22:
+            break
+        if attempt < 11:
+            time.sleep(0.25)
     if result.returncode != 0:
         raise RuntimeError(f'{endpoint}: HTTP/сеть: {result.stderr[:200]} {result.stdout[:500]}')
     try:
