@@ -340,19 +340,38 @@ case "$ARCH" in
     ;;
 esac
 
+
+CORE_PATH='/usr/local/m-ui/mihomo'
+PANEL_PATH='/usr/local/m-ui/m-ui'
+PANEL_DATA='/usr/local/m-ui/data'
+CORE_UPDATED=0
+PANEL_UPDATED=0
+PANEL_BOOTSTRAP=0
 mkdir -p /usr/local/m-ui
-if [[ ! -x /usr/local/m-ui/mihomo ]]; then
-  log "Загружаю Mihomo $CORE_VERSION с проверкой SHA256"
+
+CORE_INSTALLED="$("$CORE_PATH" -v 2>/dev/null | head -n1 || true)"
+PANEL_INSTALLED="$("$PANEL_PATH" version 2>/dev/null | head -n1 || true)"
+NEED_CORE=0
+NEED_PANEL=0
+[[ "$CORE_INSTALLED" == *"$CORE_VERSION"* ]] || NEED_CORE=1
+[[ "$PANEL_INSTALLED" == *"$PANEL_VERSION"* ]] || NEED_PANEL=1
+if ! systemctl cat m-ui.service >/dev/null 2>&1 || [[ ! -s "$PANEL_DATA/state.json" ]]; then
+  PANEL_BOOTSTRAP=1
+  NEED_PANEL=1
+fi
+
+# Сначала получаем и проверяем всё, что требуется обновить. Работающие файлы пока не меняем.
+if ((NEED_CORE)); then
+  log "Подготавливаю Mihomo $CORE_VERSION (текущая версия: ${CORE_INSTALLED:-нет})"
   download_verified "https://github.com/MetaCubeX/mihomo/releases/download/${CORE_VERSION}/${CORE_ASSET}" "$CORE_SHA" "${TMP_DIR}/mihomo.gz"
   gzip -dc "${TMP_DIR}/mihomo.gz" > "${TMP_DIR}/mihomo"
-  install -m 0755 "${TMP_DIR}/mihomo" /usr/local/m-ui/mihomo
+  chmod 0755 "${TMP_DIR}/mihomo"
+  [[ "$("${TMP_DIR}/mihomo" -v 2>/dev/null)" == *"$CORE_VERSION"* ]] || fail 'версия скачанного Mihomo не совпала'
 else
-  log 'Mihomo уже установлен — без автоматического обновления'
+  log "Без изменений: Mihomo $CORE_VERSION"
 fi
-/usr/local/m-ui/mihomo -v | head -n 1
-
-if ! systemctl cat m-ui.service >/dev/null 2>&1; then
-  log "Загружаю m-ui $PANEL_VERSION с проверкой SHA256"
+if ((NEED_PANEL)); then
+  log "Подготавливаю m-ui $PANEL_VERSION (текущая версия: ${PANEL_INSTALLED:-нет})"
   download_verified "https://github.com/RomanovCaesar/m-ui/releases/download/${PANEL_VERSION}/m-ui-linux-${ARCH}.tar.gz" "$PANEL_SHA" "${TMP_DIR}/m-ui.tar.gz"
   mkdir -p "${TMP_DIR}/unpack"
   tar -xzf "${TMP_DIR}/m-ui.tar.gz" -C "${TMP_DIR}/unpack"
@@ -360,30 +379,83 @@ if ! systemctl cat m-ui.service >/dev/null 2>&1; then
   [[ -n "$PANEL_BIN" ]] || PANEL_BIN="$(find "${TMP_DIR}/unpack" -type f -name "m-ui-linux-${ARCH}" -print -quit)"
   [[ -n "$PANEL_BIN" ]] || fail 'в архиве нет исполняемого файла m-ui'
   chmod 0755 "$PANEL_BIN"
-  curl --fail --location --silent --show-error --retry 3 "$INSTALLER_URL" -o "$INSTALLER_CACHE"
-  chmod 0600 "$INSTALLER_CACHE"
-  MUI_BINARY_PATH="$PANEL_BIN" bash "$INSTALLER_CACHE" \
-    --version "$PANEL_VERSION" --skip-mihomo --listen-ip 127.0.0.1 --port "$PANEL_PORT" --no-ssl
+  [[ "$("$PANEL_BIN" version 2>/dev/null)" == *"$PANEL_VERSION"* ]] || fail 'версия скачанной m-ui не совпала'
 else
-  log 'm-ui уже установлен — учётные данные и настройки сохраняются'
+  log "Без изменений: m-ui $PANEL_VERSION"
 fi
 if [[ ! -s "$INSTALLER_CACHE" ]]; then
-  curl --fail --location --silent --show-error --retry 3 "$INSTALLER_URL" -o "$INSTALLER_CACHE"
-  chmod 0600 "$INSTALLER_CACHE"
+  download_tmp="${TMP_DIR}/upstream-install.sh"
+  curl --fail --location --silent --show-error --retry 3 "$INSTALLER_URL" -o "$download_tmp"
+  install -m 0600 "$download_tmp" "$INSTALLER_CACHE"
+  change 'сохранён установщик m-ui для управления сертификатами'
 fi
 
+# Core обновляем атомарной заменой; предыдущий бинарник возвращается, если запуск не удался.
+if ((NEED_CORE)); then
+  if [[ -x "$CORE_PATH" ]]; then cp -a "$CORE_PATH" "${TMP_DIR}/mihomo.old"; fi
+  install -m 0755 "${TMP_DIR}/mihomo" "${CORE_PATH}.new"
+  mv -f "${CORE_PATH}.new" "$CORE_PATH"
+  CORE_UPDATED=1
+  RESTART_REQUIRED=1
+  change "Mihomo → $CORE_VERSION"
+fi
+rollback_core() {
+  if ((CORE_UPDATED)) && [[ -s "${TMP_DIR}/mihomo.old" ]]; then
+    install -m 0755 "${TMP_DIR}/mihomo.old" "${CORE_PATH}.rollback"
+    mv -f "${CORE_PATH}.rollback" "$CORE_PATH"
+    systemctl reset-failed m-ui.service 2>/dev/null || true
+    systemctl restart m-ui.service || true
+    log 'Откатил бинарник Mihomo после ошибки'
+  fi
+}
+if ((NEED_PANEL)); then
+  if ((PANEL_BOOTSTRAP)); then
+    if ! MUI_BINARY_PATH="$PANEL_BIN" bash "$INSTALLER_CACHE" \
+      --version "$PANEL_VERSION" --skip-mihomo --listen-ip 127.0.0.1 --port "$PANEL_PORT" --no-ssl; then
+      rollback_core
+      fail 'первичная установка m-ui завершилась ошибкой'
+    fi
+  else
+    # Upstream сохраняет резервную копию state.json и старый бинарник перед обновлением.
+    if ! MUI_BINARY_PATH="$PANEL_BIN" bash "$INSTALLER_CACHE" \
+      --update --version "$PANEL_VERSION" --skip-mihomo --no-ssl; then
+      rollback_core
+      fail 'не удалось обновить m-ui; проверьте резервную копию в data/backups'
+    fi
+  fi
+  PANEL_UPDATED=1
+  change "m-ui → $PANEL_VERSION"
+fi
+[[ "$("$CORE_PATH" -v 2>/dev/null)" == *"$CORE_VERSION"* ]] || fail 'после установки версия Mihomo неверная'
+[[ "$("$PANEL_PATH" version 2>/dev/null)" == *"$PANEL_VERSION"* ]] || fail 'после установки версия m-ui неверная'
+
+# Системные лимиты и сервис меняем только при различиях.
 mkdir -p "$DROPIN_DIR"
-cat > "${DROPIN_DIR}/90-test-tspu.conf" <<'UNIT'
+cat > "${TMP_DIR}/limits.conf" <<'UNIT'
 [Service]
 LimitNOFILE=65536
 TasksMax=4096
 UNIT
-systemctl daemon-reload
-systemctl enable m-ui.service
-# Повторная установка и ACME могут быстро перезапускать панель: сбрасываем только лимит ошибок старта.
-systemctl reset-failed m-ui.service 2>/dev/null || true
-systemctl restart m-ui.service
-systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился (проверьте journalctl -u m-ui -n 80)'
+SYSTEMD_CHANGED=0
+if write_if_changed "${TMP_DIR}/limits.conf" "${DROPIN_DIR}/90-test-tspu.conf"; then
+  SYSTEMD_CHANGED=1
+  RESTART_REQUIRED=1
+fi
+if ((SYSTEMD_CHANGED)); then systemctl daemon-reload; fi
+if ! systemctl is-enabled --quiet m-ui.service; then
+  systemctl enable m-ui.service
+  change 'включён автозапуск m-ui'
+fi
+if ! systemctl is-active --quiet m-ui.service; then
+  systemctl reset-failed m-ui.service 2>/dev/null || true
+  if ! systemctl start m-ui.service; then rollback_core; fail 'm-ui не запустился'; fi
+  change 'запущен m-ui'
+elif ((RESTART_REQUIRED)); then
+  systemctl reset-failed m-ui.service 2>/dev/null || true
+  if ! systemctl restart m-ui.service; then rollback_core; fail 'перезапуск m-ui завершился ошибкой'; fi
+  change 'перезапущен m-ui после изменения бинарника/лимитов'
+fi
+systemctl is-active --quiet m-ui.service || fail 'm-ui не работает'
 
 PREV_MODE="$(cat "$MODE_FILE" 2>/dev/null || true)"
 PREV_HOST="$(cat "$HOST_FILE" 2>/dev/null || true)"
