@@ -60,7 +60,7 @@ jobs:
           sudo systemctl list-timers --all --no-pager | grep -E 'acme|test-tspu' || true
 
   debian-integration:
-    name: Установка и HTTPS (debian-${ matrix.release })
+    name: Установка и HTTPS (debian-${{ matrix.release }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -69,10 +69,10 @@ jobs:
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
-      - name: Debian ${${ matrix.release }} с systemd
+      - name: Debian ${{ matrix.release }} с systemd
         shell: bash
         run: |
-          docker build --quiet --build-arg DEBIAN_RELEASE=${${ matrix.release }} \
+          docker build --quiet --build-arg DEBIAN_RELEASE=${{ matrix.release }} \
             -f tests/Dockerfile.debian -t test-tspu-debian:ci .
           docker run -d --name debian-integration --privileged \
             --cgroupns=private --tmpfs /run --tmpfs /run/lock \
