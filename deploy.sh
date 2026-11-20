@@ -20,6 +20,10 @@ KEY_FILE=''
 CA_CERT_FILE=''
 DUCKDNS_HOST=''
 DUCKDNS_TOKEN_SOURCE=''
+PANEL_USER_OVERRIDE=''
+PANEL_PASSWORD_SOURCE=''
+NO_INBOUNDS=0
+REALITY_TARGET=''
 SELF_PATH='/usr/local/sbin/test-tspu-deploy'
 INSTALLER_CACHE="${DATA_DIR}/m-ui-upstream-install.sh"
 HOST_FILE="${DATA_DIR}/panel-host"
@@ -31,6 +35,9 @@ CUSTOM_KEY="${DATA_DIR}/custom-key.pem"
 DUCKDNS_HOST_FILE="${DATA_DIR}/duckdns-host"
 DUCKDNS_TOKEN_FILE="${DATA_DIR}/duckdns-token"
 DUCKDNS_IP_FILE="${DATA_DIR}/duckdns-current-ip"
+PANEL_USER_FILE="${DATA_DIR}/panel-user"
+PANEL_PASS_FILE="${DATA_DIR}/panel-password"
+INBOUND_SECRETS_FILE="${DATA_DIR}/inbound-secrets.json"
 CHANGED=0
 RESTART_REQUIRED=0
 
@@ -48,6 +55,10 @@ usage() {
 --ip АДРЕС           : явно задать публичный IPv4 вместо автоопределения.
 --duckdns ИМЯ        : подключить бесплатный поддомен ИМЯ.duckdns.org.
 --duckdns-token-file ПУТЬ : файл с токеном DuckDNS (хранение 0600).
+--panel-password-file ПУТЬ : пароль существующей m-ui (без смены пароля).
+--panel-user ИМЯ : логин существующей m-ui; по умолчанию из настроек.
+--reality-target ИМЯ : заданный проверяемый TLS-сайт маскировки REALITY.
+--no-inbounds : не создавать новые подключения; управление только панелью.
 --cert-file ФАЙЛ     : использовать готовый TLS-сертификат (без ACME).
 --key-file ФАЙЛ      : приватный ключ готового сертификата.
 --ca-cert ФАЙЛ       : доверенный CA для проверки HTTPS (включая CI).
@@ -66,6 +77,10 @@ while (($#)); do
     --ip) (($# >= 2)) || fail 'укажите IPv4'; IP_OVERRIDE="$2"; shift 2 ;;
     --duckdns) (($# >= 2)) || fail 'укажите поддомен DuckDNS'; DUCKDNS_HOST="$2"; shift 2 ;;
     --duckdns-token-file) (($# >= 2)) || fail 'укажите путь к токену DuckDNS'; DUCKDNS_TOKEN_SOURCE="$2"; shift 2 ;;
+    --panel-password-file) (($# >= 2)) || fail 'укажите файл пароля m-ui'; PANEL_PASSWORD_SOURCE="$2"; shift 2 ;;
+    --panel-user) (($# >= 2)) || fail 'укажите логин m-ui'; PANEL_USER_OVERRIDE="$2"; shift 2 ;;
+    --reality-target) (($# >= 2)) || fail 'укажите TLS-сайт'; REALITY_TARGET="$2"; shift 2 ;;
+    --no-inbounds) NO_INBOUNDS=1; shift ;;
     --cert-file) (($# >= 2)) || fail 'укажите файл сертификата'; CERT_FILE="$2"; shift 2 ;;
     --key-file) (($# >= 2)) || fail 'укажите файл ключа'; KEY_FILE="$2"; shift 2 ;;
     --ca-cert) (($# >= 2)) || fail 'укажите файл доверенного CA'; CA_CERT_FILE="$2"; shift 2 ;;
@@ -87,6 +102,7 @@ if [[ -n "$CERT_FILE" ]]; then
   [[ -s "$CERT_FILE" && -r "$CERT_FILE" && -s "$KEY_FILE" && -r "$KEY_FILE" ]] || fail 'сертификат/ключ недоступны'
 fi
 [[ -z "$CA_CERT_FILE" || -s "$CA_CERT_FILE" && -r "$CA_CERT_FILE" ]] || fail 'файл CA недоступен'
+[[ -z "$PANEL_PASSWORD_SOURCE" || -r "$PANEL_PASSWORD_SOURCE" && -s "$PANEL_PASSWORD_SOURCE" ]] || fail 'файл пароля m-ui недоступен'
 
 is_ipv4() {
   local ip="$1" a b c d v
@@ -492,7 +508,8 @@ rollback_core() {
 if ((NEED_PANEL)); then
   if ((PANEL_BOOTSTRAP)); then
     if ! MUI_BINARY_PATH="$PANEL_BIN" bash "$INSTALLER_CACHE" \
-      --version "$PANEL_VERSION" --skip-mihomo --listen-ip 127.0.0.1 --port "$PANEL_PORT" --no-ssl; then
+      --version "$PANEL_VERSION" --skip-mihomo --listen-ip 127.0.0.1 --port "$PANEL_PORT" --no-ssl |
+      tee "${TMP_DIR}/mui-bootstrap.log"; then
       rollback_core
       fail 'первичная установка m-ui завершилась ошибкой'
     fi
@@ -505,6 +522,19 @@ if ((NEED_PANEL)); then
     fi
   fi
   change "m-ui → $PANEL_VERSION"
+  if ((PANEL_BOOTSTRAP)); then
+    login="$(sed -n 's/^Username:[[:space:]]*//p' "${TMP_DIR}/mui-bootstrap.log" | tail -n 1)"
+    password="$(sed -n 's/^Password:[[:space:]]*//p' "${TMP_DIR}/mui-bootstrap.log" | tail -n 1)"
+    if [[ -n "$login" && -n "$password" ]]; then
+      printf '%s\n' "$login" > "$PANEL_USER_FILE"
+      printf '%s\n' "$password" > "$PANEL_PASS_FILE"
+      chmod 0600 "$PANEL_USER_FILE" "$PANEL_PASS_FILE"
+      unset password
+      change 'сохранены секреты автоматизации панели (0600)'
+    else
+      fail 'не удалось прочитать сгенерированные учётные данные m-ui'
+    fi
+  fi
 fi
 [[ "$("$CORE_PATH" -v 2>/dev/null)" == *"$CORE_VERSION"* ]] || fail 'после установки версия Mihomo неверная'
 [[ "$("$PANEL_PATH" version 2>/dev/null)" == *"$PANEL_VERSION"* ]] || fail 'после установки версия m-ui неверная'
