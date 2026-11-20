@@ -22,6 +22,7 @@ SELF_PATH='/usr/local/sbin/test-tspu-deploy'
 INSTALLER_CACHE="${DATA_DIR}/m-ui-upstream-install.sh"
 HOST_FILE="${DATA_DIR}/panel-host"
 MODE_FILE="${DATA_DIR}/panel-mode"
+CERT_MODE_FILE="${DATA_DIR}/cert-mode"
 
 fail() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 log() { printf '[test-tspu] %s\n' "$*"; }
@@ -352,7 +353,7 @@ systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился
 
 PREV_MODE="$(cat "$MODE_FILE" 2>/dev/null || true)"
 PREV_HOST="$(cat "$HOST_FILE" 2>/dev/null || true)"
-if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" || -n "$CERT_FILE" ]] || { [[ "$TARGET_MODE" == ip && ! -s /root/cert/ip/fullchain.pem ]]; }; then
+if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" || -n "$CERT_FILE" ]] || { [[ "$TARGET_MODE" == ip && "$(cat "$CERT_MODE_FILE" 2>/dev/null || true)" != custom && ! -s /root/cert/ip/fullchain.pem ]]; }; then
   if [[ -n "$CERT_FILE" ]]; then
     log "Устанавливаю предоставленный TLS-сертификат: $TARGET_HOST"
     bash "$INSTALLER_CACHE" --ssl-menu --cert "$CERT_FILE" --key "$KEY_FILE" || fail "Не удалось применить TLS-сертификат"
@@ -369,6 +370,7 @@ if [[ "$TARGET_MODE" != "$PREV_MODE" || "$TARGET_HOST" != "$PREV_HOST" || -n "$C
   printf '%s\n' "$TARGET_HOST" > "${HOST_FILE}.new"
   mv -f "${MODE_FILE}.new" "$MODE_FILE"
   mv -f "${HOST_FILE}.new" "$HOST_FILE"
+  if [[ -n "$CERT_FILE" ]]; then printf 'custom\n' > "$CERT_MODE_FILE"; else printf 'acme\n' > "$CERT_MODE_FILE"; fi
 fi
 
 # Не публикуем HTTP GUI до успешного HTTPS.
