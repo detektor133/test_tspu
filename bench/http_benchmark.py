@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 HEADERS = [
     'date_utc', 'label', 'concurrency', 'seconds_configured', 'seconds_elapsed',
+    'started_utc', 'ended_utc',
     'requests_total', 'requests_ok', 'requests_failed', 'success_rate_pct',
     'bytes_ok', 'throughput_mib_s', 'ttfb_p50_ms', 'ttfb_p95_ms',
     'latency_p50_ms', 'latency_p95_ms', 'latency_p99_ms',
@@ -92,15 +93,22 @@ def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes):
             conn.close()
 
 
-def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha256, max_bytes):
+def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha256, max_bytes,
+              max_requests=None):
     completed = []
     lock = threading.Lock()
     started = time.monotonic()
     deadline = started + seconds
+    reserved = 0
 
     def worker():
+        nonlocal reserved
         batch = []
         while time.monotonic() < deadline:
+            with lock:
+                if max_requests is not None and reserved >= max_requests:
+                    break
+                reserved += 1
             batch.append(request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes))
         with lock:
             completed.extend(batch)
@@ -167,10 +175,13 @@ def main():
     now = datetime.now(timezone.utc).isoformat(timespec='seconds')
     results = []
     for level in levels:
+        started_utc = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
         measurement = run_level(target, proxy, level, args.seconds, args.timeout,
                                 args.min_bytes, args.sha256, args.max_bytes)
         row = {
             'date_utc': now, 'label': args.label,
+            'started_utc': started_utc,
+            'ended_utc': datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
             'concurrency': level, 'seconds_configured': args.seconds,
             **measurement,
         }

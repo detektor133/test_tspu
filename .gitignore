@@ -3,3 +3,12 @@
 /__pycache__/
 *.pyc
 .DS_Store
+
+# Приватные результаты и подписки полевых тестов
+/test-tspu-results/
+/field-results/
+**/private-mihomo.yaml
+**/subscription.url
+**/mihomo.log
+**/server-resources.csv
+**/measurements.csv
