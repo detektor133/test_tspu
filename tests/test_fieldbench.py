@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import secrets
+import struct
 import shutil
 import sys
 import tempfile
@@ -16,10 +17,12 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
-from generate_report import generate, valid_level
+from generate_report import generate, valid_level, attach_evidence
 from http_benchmark import HEADERS, run_level, percentile_or_missing
 from compare_runs import combine
 import vps_session
+from port_capture import parse_ingress_ipv4, port_evidence
+from http_benchmark import request_once
 
 
 class TestFieldReport(unittest.TestCase):
@@ -61,13 +64,86 @@ class TestFieldReport(unittest.TestCase):
         row = {
             "status": "ok", "measurement_status": "time_completed",
             "seconds_configured": 6, "seconds_elapsed": 6.03,
-            "latency_samples": 25, "requests_ok": 25
+            "latency_samples": 25, "requests_ok": 25,
+            "route_status": "verified", "route_packets": 45,
+            "raw_samples_complete": True, "controls_passed": True
         }
         self.assertTrue(valid_level(row))
+        self.assertFalse(valid_level({**row, "route_packets": 0}))
+        self.assertFalse(valid_level({**row, "route_status": "ambiguous"}))
+        self.assertFalse(valid_level({**row, "raw_samples_complete": False}))
+        self.assertFalse(valid_level({**row, "controls_passed": False}))
         self.assertFalse(valid_level({**row, "seconds_elapsed": 1.7}))
         self.assertFalse(valid_level({**row, "latency_samples": 8}))
         self.assertFalse(valid_level({**row, "measurement_status": "budget_limited"}))
         self.assertFalse(valid_level({**row, "measurement_status": ""}))
+
+    def test_raw_ingress_port_parser(self):
+        def packet(protocol, port):
+            ip = bytearray(40)
+            ip[0] = 0x45
+            ip[2:4] = struct.pack("!H", len(ip))
+            ip[9] = protocol
+            ip[20:22] = struct.pack("!H", 53124)
+            ip[22:24] = struct.pack("!H", port)
+            return bytes(ip)
+        self.assertEqual(parse_ingress_ipv4(packet(6, 8388)), ("8388/tcp", 40))
+        self.assertEqual(parse_ingress_ipv4(packet(17, 8443)), ("8443/udp", 40))
+        self.assertIsNone(parse_ingress_ipv4(packet(6, 8443)))  # UDP-only
+        self.assertIsNone(parse_ingress_ipv4(packet(17, 443)))  # TCP-only
+        self.assertIsNone(parse_ingress_ipv4(packet(6, 54321)))
+        self.assertIsNone(parse_ingress_ipv4(b"wrong"))
+        fragment = bytearray(packet(6, 8388))
+        fragment[6:8] = struct.pack("!H", 1)
+        self.assertIsNone(parse_ingress_ipv4(fragment))
+
+    def test_port_evidence_rejects_missing_or_contaminated_port(self):
+        empty = {"available": True, "counters": {
+            "8388/tcp": {"packets": 0, "ip_bytes": 0},
+            "443/tcp": {"packets": 0, "ip_bytes": 0}}}
+        good = {"available": True, "counters": {
+            "8388/tcp": {"packets": 50, "ip_bytes": 4300},
+            "443/tcp": {"packets": 0, "ip_bytes": 0}}}
+        result = port_evidence(empty, good, "8388/tcp")
+        self.assertEqual(result["route_status"], "verified")
+        self.assertEqual(result["route_packets"], 50)
+        self.assertEqual(port_evidence(empty, good, "443/tcp")["route_status"], "no_ingress")
+        noisy = {"available": True, "counters": {
+            "8388/tcp": {"packets": 50, "ip_bytes": 4300},
+            "443/tcp": {"packets": 1, "ip_bytes": 60}}}
+        self.assertEqual(port_evidence(empty, noisy, "8388/tcp")["route_status"], "ambiguous")
+        with self.assertRaises(RuntimeError):
+            port_evidence(good, empty, "8388/tcp")
+
+    def test_raw_samples_cannot_be_forged_as_valid_benchmark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = [{
+                "protocol": "Hysteria2", "concurrency": 4,
+                "status": "ok", "measurement_status": "time_completed",
+                "seconds_configured": 6, "seconds_elapsed": 6.1,
+                "requests_ok": 20, "requests_total": 20,
+                "bytes_ok": 20 * 1024, "latency_samples": 20,
+                "route_status": "verified", "route_packets": 100
+            }]
+            self.assertFalse(attach_evidence(root, rows))
+            self.assertFalse(valid_level(rows[0]))
+            (root / "negative-controls.json").write_text(json.dumps({
+                "DIRECT": "failed_as_expected", "BROKEN_SOCKS5": "failed_as_expected"
+            }))
+            with (root / "request-samples.csv").open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "protocol", "concurrency", "ok", "bytes_ok", "nonce"])
+                writer.writeheader()
+                for i in range(20):
+                    writer.writerow({"protocol": "Hysteria2", "concurrency": 4,
+                                     "ok": 1, "bytes_ok": 1024,
+                                     "nonce": ("%024x" % i)})
+            self.assertTrue(attach_evidence(root, rows))
+            self.assertTrue(valid_level(rows[0]))
+            rows[0]["bytes_ok"] = 999
+            self.assertTrue(attach_evidence(root, rows))
+            self.assertFalse(valid_level(rows[0]))
 
     def test_no_false_percentiles_from_tiny_samples(self):
         self.assertEqual(percentile_or_missing([1] * 19, .95, 20), "")
@@ -198,6 +274,16 @@ class TestFieldReport(unittest.TestCase):
                 payload = resp.read()
             self.assertEqual(len(payload), 2048)
             self.assertEqual(hashlib.sha256(payload).hexdigest(), state["sha256"])
+            request = request_once(urlsplit("http://127.0.0.1:18180/payload"),
+                                   None, 3, 2048, state["sha256"], 2048,
+                                   verify_nonce=True)
+            self.assertTrue(request[0], request[4])
+            self.assertEqual(len(request[5]), 24)
+            # When server-side nonce echo is absent/mismatched, reject even if SHA matches.
+            no_nonce = request_once(urlsplit("http://127.0.0.1:18180/payload"),
+                                     None, 3, 2048, state["sha256"], 2048,
+                                     verify_nonce=False)
+            self.assertTrue(no_nonce[0])
             time.sleep(1.3)
             vps_session.stop(root)
             with (root / "server-resources.csv").open() as stream:
