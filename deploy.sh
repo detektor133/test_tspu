@@ -767,18 +767,25 @@ def cert_path(name):
         raise SystemExit(f'Сертификат панели недоступен: {name}')
     return path
 
-# Ссылки на текущие TLS-файлы постоянны даже при переходе от IP к домену.
-for source, link in [(cert_path('panelCertFile'), DIR / 'listener-cert.pem'),
-                     (cert_path('panelKeyFile'), DIR / 'listener-key.pem')]:
-    target = pathlib.Path(source).resolve()
-    if link.is_symlink() and link.resolve() == target:
+# Mihomo ограничивает чтение файлов директорией data (SAFE_PATHS).
+# Копируем сертификаты ВНУТРЬ data, а не оставляем ссылки на /root/cert.
+import shutil
+tls_dir = pathlib.Path('/usr/local/m-ui/data/test-tspu-tls')
+tls_dir.mkdir(mode=0o700, exist_ok=True)
+tls_changed = False
+for source, dest in [(cert_path('panelCertFile'), tls_dir / 'fullchain.pem'),
+                     (cert_path('panelKeyFile'), tls_dir / 'privkey.pem')]:
+    source_data = pathlib.Path(source).read_bytes()
+    if dest.is_file() and dest.read_bytes() == source_data:
         continue
-    tmp = link.with_suffix(link.suffix + '.new')
-    tmp.unlink(missing_ok=True)
-    tmp.symlink_to(target)
-    tmp.replace(link)
+    fd, tmp = tempfile.mkstemp(prefix='.tls-', dir=tls_dir)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(source_data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dest)
+    tls_changed = True
 
-crt, key = str(DIR / 'listener-cert.pem'), str(DIR / 'listener-key.pem')
+crt, key = str(tls_dir / 'fullchain.pem'), str(tls_dir / 'privkey.pem')
 
 def ready_reality_target():
     candidates = [sni_override] if sni_override else [
@@ -899,9 +906,9 @@ else:
     print('Без изменений: REALITY')
 
 api('POST', 'api/core/test')
-if created_count:
+if created_count or tls_changed:
     api('POST', 'api/core/restart')
-    print(f'Mihomo: применено новых inbounds: {created_count}')
+    print(f'Mihomo: применено новых inbounds: {created_count}; TLS обновлён: {tls_changed}')
 # m-ui сохраняет inbounds в state, изменения применяются через API.
 print('Готово: inbounds сохранены через m-ui API')
 PY
