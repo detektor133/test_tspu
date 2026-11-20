@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from generate_report import chart, ORDER
+from generate_report import chart, ORDER, valid_level
 
 
 def rows_in(path):
@@ -49,10 +49,11 @@ def combine(folders, output):
                 if not r:
                     columns.append("—")
                     continue
-                if r.get("status") != "ok":
+                if not valid_level(r):
+                    issue = (r.get("status", "неизвестно") if r.get("status") != "ok"
+                             else "unverified_legacy")
                     columns.append("%s/%s · не сопоставимо (%s)" %
-                                   (r.get("requests_ok", 0), r.get("requests_total", 0),
-                                    r.get("status", "неизвестно")))
+                                   (r.get("requests_ok", 0), r.get("requests_total", 0), issue))
                 else:
                     columns.append("%s/%s · %s · %s" %
                                    (r.get("requests_ok", 0), r.get("requests_total", 0),
@@ -65,7 +66,7 @@ def combine(folders, output):
                      for m in metadata.values()}
     compatible = len(methodologies) == 1
     shared = set.intersection(*[
-        set(level for (protocol, level), r in idx.items() if r.get('status') == 'ok')
+        set(level for (protocol, level), r in idx.items() if valid_level(r))
         for idx in indexed.values()
     ]) if indexed else set()
     chosen = (8 if 8 in shared else (min(shared) if shared else None)) if compatible else None
@@ -73,7 +74,7 @@ def combine(folders, output):
     if chosen is not None:
         for protocol in ORDER:
             # Never chart an unpaired protocol as an apparent network comparison.
-            if not all(indexed[net].get((protocol, chosen), {}).get('status') == 'ok'
+            if not all(valid_level(indexed[net].get((protocol, chosen), {}))
                        for net in datasets):
                 continue
             for net in datasets:
@@ -86,7 +87,8 @@ def combine(folders, output):
         "Сети помечены вручную и автоматически не верифицированы. "
         "Разница скорости не доказывает вмешательство ТСПУ. "
         "В сравнительные цифры и график входят только полные по времени уровни с >=20 "
-        "успешными ответами (статус ok). Раннее исчерпание бюджета и малая выборка "
+        "успешными ответами (статус ok и подтверждённая длительность). "
+        "Старые CSV без метаданных, раннее исчерпание бюджета и малая выборка "
         "показаны как несопоставимые. Для графика требуется одинаковая длительность "
         "и размер ответа. Мобильный сигнал, маршрут и часы испытаний могли отличаться."
     )
