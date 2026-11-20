@@ -264,7 +264,7 @@ run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
 assert_eq "$(sudo cat "$TMP/duckdns.log" | wc -l)" "2"
 
 log "Повторная проверка всех прокси после смены IP DuckDNS"
-bash tests/proxy-e2e.sh example.duckdns.org "$TMP/ca.pem"
+bash tests/proxy-e2e.sh example.duckdns.org "$TMP/ca.pem" 2
 
 log "Проверка отката сетевых настроек"
 run_root bash deploy.sh --rollback-tuning >"$TMP/rollback.log"
