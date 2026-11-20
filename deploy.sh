@@ -520,6 +520,22 @@ if ((TUNING_CHANGED || SYSCTL_DRIFT)); then
     log 'ПРЕДУПРЕЖДЕНИЕ: некоторые sysctl не применились (ограничения ядра или контейнера)'
   fi
   # Нельзя сообщать об успешном исправлении drift, если sysctl -p завершился ошибкой.
+  if ((SYSCTL_APPLIED)); then
+    # Некоторые контейнеры возвращают код 0, но ядро ограничивает rmem/wmem.
+    # Не считаем восстановление успешным без проверки фактических значений.
+    while IFS='=' read -r key value; do
+      key="${key//[[:space:]]/}"
+      value="${value//[[:space:]]/}"
+      [[ -n "$key" && "${key:0:1}" != '#' ]] || continue
+      if [[ "$(sysctl -n "$key" 2>/dev/null || true)" != "$value" ]]; then
+        SYSCTL_APPLIED=0
+        break
+      fi
+    done < "${TMP_DIR}/tuning.conf"
+    if ((!SYSCTL_APPLIED)); then
+      log 'ПРЕДУПРЕЖДЕНИЕ: ядро ограничивает часть sysctl; повторная попытка не считается изменением'
+    fi
+  fi
   if ((SYSCTL_DRIFT && !TUNING_CHANGED && SYSCTL_APPLIED)); then
     change 'восстановлены текущие значения sysctl'
   fi
