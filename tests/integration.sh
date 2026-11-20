@@ -130,15 +130,27 @@ if grep -Eq '^(Username|Password):' "$TMP/install.log"; then
   echo 'Пароли m-ui попали в лог инсталлятора' >&2
   exit 1
 fi
+panel_uri="$(sudo /usr/bin/python3 - <<'PY'
+import json
+data=json.load(open('/usr/local/m-ui/data/state.json'))
+print('/'+data['settings']['panelPath'].strip('/')+'/api/inbounds')
+PY
+)"
+api_code="$(curl --silent --show-error --noproxy '*' \
+  --cacert "$TMP/ca.pem" --resolve '8.8.8.8:2053:127.0.0.1' \
+  --max-time 6 -o /dev/null -w '%{http_code}' "https://8.8.8.8:2053$panel_uri")"
+assert_eq "$api_code" 401
 
 log "Повторный деплой: отсутствие изменений и прежний PID"
 pid_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
+subscriptions_before="$(sudo sha256sum /var/lib/test-tspu/subscriptions.txt | awk '{print $1}')"
 sysctl_before="$(sudo stat -c %Y /etc/sysctl.d/90-test-tspu.conf)"
 unit_before="$(sudo stat -c %Y /etc/systemd/system/m-ui.service.d/90-test-tspu.conf)"
 run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/repeat.log" 2>&1 || { cat "$TMP/repeat.log"; exit 1; }
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "8.8.8.8"
 sudo systemctl is-active --quiet m-ui.service
 assert_eq "$(sudo systemctl show -p MainPID --value m-ui.service)" "$pid_before"
+assert_eq "$(sudo sha256sum /var/lib/test-tspu/subscriptions.txt | awk '{print $1}')" "$subscriptions_before"
 assert_eq "$(sudo stat -c %Y /etc/sysctl.d/90-test-tspu.conf)" "$sysctl_before"
 assert_eq "$(sudo stat -c %Y /etc/systemd/system/m-ui.service.d/90-test-tspu.conf)" "$unit_before"
 grep -q 'Итог: без изменений' "$TMP/repeat.log"
