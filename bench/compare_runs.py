@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from generate_report import chart, ORDER, valid_level
+from generate_report import chart, ORDER, valid_level, attach_evidence
 
 
 def rows_in(path):
@@ -27,6 +27,7 @@ def combine(folders, output):
         if not label or label in datasets:
             raise SystemExit("У каждой серии должна быть своя метка сети")
         datasets[label] = rows_in(folder)
+        attach_evidence(folder, datasets[label])
         metadata[label] = info
     # Проверяем одинаковую методику. Не приводим разнородные уровни к
     # фиктивным общим цифрам: каждый факт показываем только в своей ячейке.
@@ -38,7 +39,7 @@ def combine(folders, output):
     indexed = {net: index(rows) for net, rows in datasets.items()}
     levels = sorted({level for data in indexed.values() for _, level in data})
     header = "| Протокол | Потоки | " + " | ".join(
-        net + ": OK/все · МиБ/с · p95, мс" for net in datasets) + " |"
+        net + ": OK/все · МиБ/с · HTTP ping p95, мс" for net in datasets) + " |"
     delimiter = "|---|---:|" + "|".join(["---:" for _ in datasets]) + "|"
     table = [header, delimiter]
     for protocol in ORDER:
@@ -58,11 +59,12 @@ def combine(folders, output):
                     columns.append("%s/%s · %s · %s" %
                                    (r.get("requests_ok", 0), r.get("requests_total", 0),
                                     r.get("throughput_mib_s", "—"),
-                                    r.get("latency_p95_ms") or "—"))
+                                    r.get("app_rtt_p95_ms") or "—"))
             table.append("| " + " | ".join(columns) + " |")
     # Для графика выбираем только совместимый уровень параллельности,
     # предпочтительно 8. Отсутствующие успешные измерения не сравниваем.
-    methodologies = {(m.get('seconds_per_level'), m.get('payload_bytes'))
+    methodologies = {(m.get('seconds_per_level'), m.get('payload_bytes'),
+                      m.get('ping_interval_seconds'), tuple(m.get('levels') or []))
                      for m in metadata.values()}
     compatible = len(methodologies) == 1
     shared = set.intersection(*[
@@ -90,7 +92,8 @@ def combine(folders, output):
         "успешными ответами (статус ok и подтверждённая длительность). "
         "Старые CSV без метаданных, раннее исчерпание бюджета и малая выборка "
         "показаны как несопоставимые. Для графика требуется одинаковая длительность "
-        "и размер ответа. Мобильный сигнал, маршрут и часы испытаний могли отличаться."
+        "и размер ответа, набор ступеней и частота HTTP ping. "
+        "Мобильный сигнал, маршрут и часы испытаний могли отличаться."
     )
     entries = "\n".join(
         "- %s: UTC %s; телефон %s; ошибки запуска: %s" %

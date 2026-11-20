@@ -11,12 +11,13 @@ import hashlib
 import http.client
 import math
 import pathlib
+import secrets
 import statistics
 import ssl
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
 
 HEADERS = [
     'date_utc', 'label', 'concurrency', 'seconds_configured', 'seconds_elapsed',
@@ -25,6 +26,8 @@ HEADERS = [
     'bytes_ok', 'throughput_mib_s', 'ttfb_p50_ms', 'ttfb_p95_ms',
     'latency_p50_ms', 'latency_p95_ms', 'latency_p99_ms',
     'measurement_status', 'duration_coverage_pct', 'latency_samples',
+    'app_rtt_samples', 'app_rtt_failed', 'app_rtt_p50_ms', 'app_rtt_p95_ms',
+    'peak_inflight',
 ]
 
 
@@ -45,8 +48,14 @@ def percentile_or_missing(samples, q, minimum):
     return round(percentile(samples, q), 2) if len(samples) >= minimum else ""
 
 
-def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes):
+def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes,
+                 verify_nonce=False):
     start = time.monotonic()
+    start_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    nonce = secrets.token_hex(12) if verify_nonce else ""
+    if verify_nonce:
+        query = urlencode([*parse_qsl(target.query, keep_blank_values=True), ("nonce", nonce)])
+        target = urlsplit(urlunsplit((target.scheme, target.netloc, target.path, query, "")))
     conn = None
     try:
         if proxy is not None:
@@ -95,25 +104,53 @@ def request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes):
             raise ValueError(f'HTTP {response.status} или недостаточный размер ответа')
         if digest and digest.hexdigest() != expected_sha256:
             raise ValueError('SHA256 полезной нагрузки не совпал')
-        return (True, count, ttfb, elapsed_ms)
-    except (OSError, TimeoutError, ValueError, http.client.HTTPException, ssl.SSLError):
-        return (False, 0, 0.0, 0.0)
+        if verify_nonce and response.getheader("X-Test-Nonce") != nonce:
+            raise ValueError("ответ не содержит nonce исходного запроса")
+        end_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        return (True, count, ttfb, elapsed_ms, "", nonce, start_utc, end_utc)
+    except (OSError, TimeoutError, ValueError, http.client.HTTPException, ssl.SSLError) as exc:
+        end_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        return (False, 0, 0.0, (time.monotonic() - start) * 1000,
+                type(exc).__name__, nonce, start_utc, end_utc)
     finally:
         if conn is not None:
             conn.close()
 
 
 def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha256, max_bytes,
-              max_requests=None):
+              max_requests=None, on_sample=None, verify_nonce=False,
+              ping_target=None, on_ping_sample=None, ping_interval=1.0):
     completed = []
     lock = threading.Lock()
     started = time.monotonic()
     deadline = started + seconds
     reserved = 0
+    active = 0
+    peak_active = 0
     budget_limited = False
+    app_ping = []
+    stop_ping = threading.Event()
+
+    def ping_worker():
+        # Small HTTP request-response through the SAME selected VPN while
+        # download workers saturate it. This is application-level RTT,
+        # NOT ICMP RTT; it includes connection/stream setup and forwarding.
+        while not stop_ping.is_set() and time.monotonic() < deadline:
+            result = request_once(ping_target, proxy, min(timeout, 6), 0, None, 0,
+                                  verify_nonce=True)
+            app_ping.append(result)
+            if on_ping_sample is not None:
+                on_ping_sample({
+                    "started_utc": result[6], "ended_utc": result[7],
+                    "ok": int(result[0]), "bytes_ok": 0,
+                    "ttfb_ms": round(result[2], 2) if result[0] else "",
+                    "latency_ms": round(result[3], 2),
+                    "error_type": result[4], "nonce": result[5],
+                })
+            stop_ping.wait(min(ping_interval, max(0.0, deadline - time.monotonic())))
 
     def worker():
-        nonlocal reserved, budget_limited
+        nonlocal reserved, budget_limited, active, peak_active
         batch = []
         while time.monotonic() < deadline:
             with lock:
@@ -123,16 +160,44 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
                         budget_limited = True
                     break
                 reserved += 1
-            batch.append(request_once(target, proxy, timeout, min_bytes, expected_sha256, max_bytes))
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                result = request_once(target, proxy, timeout, min_bytes, expected_sha256,
+                                      max_bytes, verify_nonce=verify_nonce)
+                batch.append(result)
+            finally:
+                with lock:
+                    active -= 1
+            if on_sample is not None:
+                on_sample({
+                    "started_utc": result[6], "ended_utc": result[7],
+                    "ok": int(result[0]), "bytes_ok": result[1],
+                    "ttfb_ms": round(result[2], 2) if result[0] else "",
+                    "latency_ms": round(result[3], 2),
+                    "error_type": result[4], "nonce": result[5],
+                })
         with lock:
             completed.extend(batch)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        tasks = [executor.submit(worker) for _ in range(threads)]
-        for task in tasks:
-            task.result()
-    wall = time.monotonic() - started
+    pinger = None
+    if ping_target is not None:
+        pinger = threading.Thread(target=ping_worker, daemon=True)
+        pinger.start()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            tasks = [executor.submit(worker) for _ in range(threads)]
+            for task in tasks:
+                task.result()
+    finally:
+        # Measuring download throughput must NOT include waiting for a
+        # separate in-flight ping after all download workers have finished.
+        wall = time.monotonic() - started
+        stop_ping.set()
+        if pinger is not None:
+            pinger.join()  # A request is timeout-bounded; never leak into next profile.
     ok = [r for r in completed if r[0]]
+    ping_ok = [r for r in app_ping if r[0]]
     first_byte = [r[2] for r in ok]
     full_latency = [r[3] for r in ok]
     return {
@@ -151,6 +216,13 @@ def run_level(target, proxy, threads, seconds, timeout, min_bytes, expected_sha2
         'measurement_status': 'budget_limited' if budget_limited else 'time_completed',
         'duration_coverage_pct': round(min(100.0, wall / seconds * 100), 1),
         'latency_samples': len(ok),
+        'peak_inflight': peak_active,
+        'app_rtt_samples': len(ping_ok),
+        'app_rtt_failed': len(app_ping) - len(ping_ok),
+        'app_rtt_p50_ms': (round(percentile([r[3] for r in ping_ok], .5), 2)
+                           if ping_ok else ''),
+        'app_rtt_p95_ms': percentile_or_missing([r[3] for r in ping_ok],
+                                               .95, MIN_P95_SAMPLES),
     }
 
 

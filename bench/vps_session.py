@@ -4,6 +4,7 @@
 Run only for your own test server. No listener is exposed outside 127.0.0.1.
 """
 import argparse
+import ipaddress
 import json
 import os
 import pathlib
@@ -48,9 +49,18 @@ def read_state(root):
     return json.loads(p.read_text())
 
 
-def start(root, duration, size):
+def start(root, duration, size, capture=False):
     if not (5 <= duration <= 7200 and 1024 <= size <= 16 * 1024 * 1024):
         raise SystemExit("Неверная длительность или размер данных")
+    source_ip = None
+    if capture:
+        connection = os.environ.get("SSH_CONNECTION", "").split()
+        if len(connection) != 4:
+            raise SystemExit("Нет SSH_CONNECTION: нельзя привязать пакеты к телефону")
+        try:
+            source_ip = str(ipaddress.IPv4Address(connection[0]))
+        except ipaddress.AddressValueError:
+            raise SystemExit("Счётчик VPS требует IPv4 SSH-клиента")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     if (root / "session.json").exists():
@@ -86,8 +96,36 @@ def start(root, duration, size):
         start_new_session=True,
     )
     monitor_log.close()
+    capture_pid = None
+    capture_status = {"available": False, "reason": "not requested"}
+    if capture:
+        capture_log = (root / "capture.log").open("w")
+        observer = subprocess.Popen(
+            [sys.executable, str(here / "port_capture.py"),
+             "--output", str(root / "port-counters.json"),
+             "--duration", str(duration), "--source-ip", source_ip],
+            stdin=subprocess.DEVNULL, stdout=capture_log,
+            stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        capture_log.close()
+        capture_pid = observer.pid
+        for _ in range(40):
+            if (root / "port-counters.json").is_file():
+                capture_status = json.loads((root / "port-counters.json").read_text())
+                break
+            if observer.poll() is not None:
+                break
+            time.sleep(.1)
+        if not capture_status.get("available"):
+            terminate(origin.pid)
+            terminate(monitor.pid)
+            terminate(capture_pid)
+            raise SystemExit("Не удалось включить независимый учёт пакетов на VPS: "
+                             + capture_status.get("reason", "нет AF_PACKET/CAP_NET_RAW")
+                             + "; см. " + str(root / "capture.log"))
     state = {"origin_pid": origin.pid, "monitor_pid": monitor.pid,
-             "sha256": digest, "size": size, "duration": duration}
+             "capture_pid": capture_pid, "sha256": digest, "size": size,
+             "duration": duration}
     (root / "session.json").write_text(json.dumps(state))
     (root / "session.json").chmod(0o600)
     watchdog_log = (root / "watchdog.log").open("w")
@@ -99,7 +137,7 @@ def start(root, duration, size):
     )
     watchdog_log.close()
     print(json.dumps({"sha256": digest, "size": size,
-                      "port": 18180}), flush=True)
+                      "port": 18180, "capture": capture_status.get("available", False)}), flush=True)
 
 
 def stop(root):
@@ -107,6 +145,7 @@ def stop(root):
     # Достаточно SIGTERM: CSV монитор записывает и flush-ит на каждом шаге.
     terminate(state.get("origin_pid"))
     terminate(state.get("monitor_pid"))
+    terminate(state.get("capture_pid"))
     print(json.dumps({"stopped": True,
                       "monitor_available": (root / "server-resources.csv").exists()}))
 
@@ -117,21 +156,36 @@ def guard(root, duration):
     state = read_state(root)
     terminate(state.get("origin_pid"))
     terminate(state.get("monitor_pid"))
+    terminate(state.get("capture_pid"))
+
+
+def counters(root):
+    path = root / 'port-counters.json'
+    if not path.is_file():
+        raise SystemExit('Нет счётчиков пакетов; вызовите start --capture')
+    data = json.loads(path.read_text())
+    heartbeat = data.get("updated_monotonic")
+    if not isinstance(heartbeat, (int, float)) or time.monotonic() - heartbeat > 2.0:
+        data["active"] = False  # fail closed when observer stopped unexpectedly
+    print(json.dumps(data))
 
 
 def main():
     os.umask(0o077)
     p = argparse.ArgumentParser()
-    p.add_argument("action", choices=("start", "stop", "guard"))
+    p.add_argument("action", choices=("start", "stop", "guard", "counters"))
     p.add_argument("--dir", required=True)
     p.add_argument("--duration", type=int, default=240)
     p.add_argument("--size", type=int, default=262144)
+    p.add_argument("--capture", action="store_true")
     a = p.parse_args()
     root = directory(a.dir)
     if a.action == "start":
-        start(root, a.duration, a.size)
+        start(root, a.duration, a.size, capture=a.capture)
     elif a.action == "stop":
         stop(root)
+    elif a.action == "counters":
+        counters(root)
     else:
         guard(root, a.duration)
 

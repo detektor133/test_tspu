@@ -131,8 +131,10 @@ config['mode']='rule'
 config['external-controller']='127.0.0.1:'+os.environ['CTRL_PORT']
 config['secret']='ci-local-only'
 config['log-level']='warning'
+config['proxies'].append({'name': 'CI-BROKEN-SOCKS5', 'type': 'socks5',
+                           'server': '127.0.0.1', 'port': 1})
 config['proxy-groups']=[{'name':'E2E', 'type':'select',
-                         'proxies':[proxy['name'] for proxy in proxies]}]
+                         'proxies':[proxy['name'] for proxy in config['proxies']]}]
 config['rules']=['MATCH,E2E']
 (root/'client.yaml').write_text(yaml.safe_dump(config,sort_keys=False,allow_unicode=True))
 (root/'targets.json').write_text(json.dumps([
@@ -201,6 +203,38 @@ for item in json.load(open(sys.argv[1])):
     print(str(item['port'])+'\t'+item['type']+'\t'+item['name'])
 PY
 )
+# Отрицательный контроль: заведомо сломанный outbound не имеет права
+# незаметно перейти на DIRECT и получить /probe (клиент и origin на одном runner).
+curl --noproxy '*' --silent --show-error --fail --max-time 4 \
+  --request PUT --header 'Authorization: Bearer ci-local-only' \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"CI-BROKEN-SOCKS5"}' \
+  "http://127.0.0.1:${CTRL_PORT}/proxies/E2E" >/dev/null ||
+  fatal 'не удалось выбрать отрицательный контроль'
+if curl --noproxy '' --silent --fail --connect-timeout 2 --max-time 4 \
+  --proxy "http://127.0.0.1:${MIXED_PORT}" \
+  'http://127.0.0.1:18180/probe' 2>/dev/null |
+  grep -Fxq 'tspu-e2e-through-mihomo'; then
+  fatal 'КРИТИЧЕСКАЯ ОШИБКА: сломанный outbound неожиданно прошёл к origin'
+fi
+echo 'E2E OK: отрицательный контроль не прошёл через резервный DIRECT'
+# Выбираем исходный рабочий профиль до теста пропускной способности.
+first="$(/usr/bin/python3 - "$ROOT/targets.json" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1]))[0]['name'])
+PY
+)"
+payload="$(NAME="$first" /usr/bin/python3 - <<'PY'
+import os,json
+print(json.dumps({'name':os.environ['NAME']}))
+PY
+)"
+curl --noproxy '*' --silent --fail --max-time 4 \
+  --request PUT --header 'Authorization: Bearer ci-local-only' \
+  --header 'Content-Type: application/json' \
+  --data "$payload" "http://127.0.0.1:${CTRL_PORT}/proxies/E2E" >/dev/null ||
+  fatal 'не удалось восстановить рабочий профиль после отрицательного контроля'
+
 # Дымовой бенчмарк на одном runner: он проверяет КОД замеров,
 # но его производительность нельзя переносить на российские сети.
 head -c 131072 /dev/urandom > "$ROOT/origin/payload.bin"
