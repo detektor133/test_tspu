@@ -208,6 +208,7 @@ printf 'симулированный сертификат\n' > /root/cert/ip/ful
 MOCK
 run_root bash deploy.sh --sync-ip --ip 9.9.9.9 >"$TMP/change-auto.log"
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "9.9.9.9"
+sudo grep -q 'https://9.9.9.9:2053/' /var/lib/test-tspu/subscriptions.txt
 
 sudo tee /var/lib/test-tspu/m-ui-upstream-install.sh >/dev/null <<'MOCK'
 #!/usr/bin/env bash
@@ -258,6 +259,7 @@ run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
     cat "$TMP/duckdns-sync.log"; exit 1;
   }
 assert_eq "$(sudo cat /var/lib/test-tspu/duckdns-current-ip)" "1.1.1.1"
+sudo grep -q 'https://example.duckdns.org:2053/' /var/lib/test-tspu/subscriptions.txt
 run_root env PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/duckdns.log" bash deploy.sh \
   --sync-ip --ip 1.1.1.1 >"$TMP/duckdns-noop.log"
 assert_eq "$(sudo cat "$TMP/duckdns.log" | wc -l)" "2"
