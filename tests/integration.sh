@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Интеграционные тесты на временном GitHub Actions runner, без VPS и Let's Encrypt.
 set -Eeuo pipefail
-# shellcheck disable=SC2024
-# Перенаправление выполняет runner: временные логи должны принадлежать ему, не root.
+# Вспомогательная функция: перенаправляет вывод в журнал пользователя runner, а не root.
+run_root() { sudo "$@"; }
 umask 077
 cd "$(dirname "$0")/.."
 
@@ -36,6 +36,10 @@ make_cert ip-a "IP:8.8.8.8"
 make_cert ip-b "IP:1.1.1.1"
 make_cert panel "DNS:panel.example.test"
 
+# Тестовый CA делаем доверенным ОС, чтобы повторный запуск проверял HTTPS без особых флагов.
+sudo install -m 0644 "$TMP/ca.pem" /usr/local/share/ca-certificates/test-tspu-ci.crt
+sudo update-ca-certificates >/dev/null
+
 check_https() {
   local host="$1" code
   code="$(curl -sS --noproxy '*' --cacert "$TMP/ca.pem" \
@@ -47,7 +51,7 @@ check_https() {
 }
 
 log "Запуск настоящего деплоя: Mihomo, m-ui, systemd и TLS"
-sudo bash deploy.sh --ip 8.8.8.8 --cert-file "$TMP/ip-a.pem" \
+run_root bash deploy.sh --ip 8.8.8.8 --cert-file "$TMP/ip-a.pem" \
   --key-file "$TMP/ip-a.key" --ca-cert "$TMP/ca.pem" >"$TMP/install.log" 2>&1 || {
     cat "$TMP/install.log"; sudo journalctl -u m-ui -n 50 --no-pager || true; exit 1;
   }
@@ -66,13 +70,13 @@ assert_eq "$(sudo cat /var/lib/test-tspu/cert-mode)" "custom"
 check_https 8.8.8.8
 
 log "Повторный деплой не должен сбрасывать GUI или запрашивать ACME"
-sudo bash deploy.sh --ip 8.8.8.8 >"$TMP/repeat.log" 2>&1 || { cat "$TMP/repeat.log"; exit 1; }
+run_root bash deploy.sh --ip 8.8.8.8 >"$TMP/repeat.log" 2>&1 || { cat "$TMP/repeat.log"; exit 1; }
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "8.8.8.8"
 sudo systemctl is-active --quiet m-ui.service
 check_https 8.8.8.8
 
 log "Смена IP с новым сертификатом"
-sudo bash deploy.sh --ip 1.1.1.1 --cert-file "$TMP/ip-b.pem" \
+run_root bash deploy.sh --ip 1.1.1.1 --cert-file "$TMP/ip-b.pem" \
   --key-file "$TMP/ip-b.key" --ca-cert "$TMP/ca.pem" >"$TMP/change-ip.log" 2>&1 || {
     cat "$TMP/change-ip.log"; exit 1;
   }
@@ -80,7 +84,7 @@ assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "1.1.1.1"
 check_https 1.1.1.1
 
 log "Проверка --sync-ip без изменения адреса"
-sudo bash deploy.sh --sync-ip --ip 1.1.1.1 >"$TMP/nochange.log"
+run_root bash deploy.sh --sync-ip --ip 1.1.1.1 >"$TMP/nochange.log"
 grep -q 'IP не изменился' "$TMP/nochange.log"
 
 log "Имитация перевыпуска ACME: успех и ошибка с сохранением старого IP"
@@ -92,32 +96,32 @@ set -euo pipefail
 mkdir -p /root/cert/ip
 printf 'симулированный сертификат\n' > /root/cert/ip/fullchain.pem
 MOCK
-sudo bash deploy.sh --sync-ip --ip 9.9.9.9 >"$TMP/change-auto.log"
+run_root bash deploy.sh --sync-ip --ip 9.9.9.9 >"$TMP/change-auto.log"
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "9.9.9.9"
 
 sudo tee /var/lib/test-tspu/m-ui-upstream-install.sh >/dev/null <<'MOCK'
 #!/usr/bin/env bash
 exit 8
 MOCK
-if sudo bash deploy.sh --sync-ip --ip 4.4.4.4 >"$TMP/fail-auto.log" 2>&1; then
+if run_root bash deploy.sh --sync-ip --ip 4.4.4.4 >"$TMP/fail-auto.log" 2>&1; then
   echo "Ошибочный перевыпуск неожиданно прошёл" >&2; exit 1
 fi
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "9.9.9.9"
 sudo cp "$TMP/original-upstream.sh" /var/lib/test-tspu/m-ui-upstream-install.sh
 
 log "Переключение на домен с локальным тестовым сертификатом"
-sudo bash deploy.sh --domain panel.example.test --cert-file "$TMP/panel.pem" \
+run_root bash deploy.sh --domain panel.example.test --cert-file "$TMP/panel.pem" \
   --key-file "$TMP/panel.key" --ca-cert "$TMP/ca.pem" >"$TMP/domain.log" 2>&1 || {
     cat "$TMP/domain.log"; exit 1;
   }
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "panel.example.test"
 assert_eq "$(sudo cat /var/lib/test-tspu/panel-mode)" "domain"
 check_https panel.example.test
-sudo bash deploy.sh --sync-ip --ip 8.8.8.8 >"$TMP/domain-sync.log"
+run_root bash deploy.sh --sync-ip --ip 8.8.8.8 >"$TMP/domain-sync.log"
 grep -q 'Для домена сертификат привязан к имени' "$TMP/domain-sync.log"
 
 log "Проверка отката сетевых настроек"
-sudo bash deploy.sh --rollback-tuning >"$TMP/rollback.log"
+run_root bash deploy.sh --rollback-tuning >"$TMP/rollback.log"
 [[ ! -e /etc/sysctl.d/90-test-tspu.conf ]]
 [[ ! -e /etc/systemd/system/m-ui.service.d/90-test-tspu.conf ]]
 
