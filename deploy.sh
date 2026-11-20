@@ -348,6 +348,8 @@ TasksMax=4096
 UNIT
 systemctl daemon-reload
 systemctl enable m-ui.service
+# Повторная установка и ACME могут быстро перезапускать панель: сбрасываем только лимит ошибок старта.
+systemctl reset-failed m-ui.service 2>/dev/null || true
 systemctl restart m-ui.service
 systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился (проверьте journalctl -u m-ui -n 80)'
 
@@ -376,6 +378,7 @@ fi
 # Не публикуем HTTP GUI до успешного HTTPS.
 systemctl stop m-ui.service
 /usr/local/m-ui/m-ui configure --data-dir /usr/local/m-ui/data --listen-ip 0.0.0.0 >/dev/null
+systemctl reset-failed m-ui.service 2>/dev/null || true
 systemctl start m-ui.service
 systemctl is-active --quiet m-ui.service || fail 'm-ui не запустился после активации HTTPS'
 
