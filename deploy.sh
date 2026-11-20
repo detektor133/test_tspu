@@ -694,7 +694,7 @@ def api(method, endpoint, payload=None):
     result = subprocess.run(argv, input=json.dumps(payload) if payload is not None else None,
                             capture_output=True, text=True, timeout=16)
     if result.returncode != 0:
-        raise RuntimeError(f'{endpoint}: HTTP/сеть: {result.stderr[:300]}')
+        raise RuntimeError(f'{endpoint}: HTTP/сеть: {result.stderr[:200]} {result.stdout[:500]}')
     try:
         response = json.loads(result.stdout)
     except ValueError as exc:
