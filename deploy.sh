@@ -18,6 +18,8 @@ IP_OVERRIDE=''
 CERT_FILE=''
 KEY_FILE=''
 CA_CERT_FILE=''
+DUCKDNS_HOST=''
+DUCKDNS_TOKEN_SOURCE=''
 SELF_PATH='/usr/local/sbin/test-tspu-deploy'
 INSTALLER_CACHE="${DATA_DIR}/m-ui-upstream-install.sh"
 HOST_FILE="${DATA_DIR}/panel-host"
@@ -26,6 +28,9 @@ CERT_MODE_FILE="${DATA_DIR}/cert-mode"
 PUBLIC_MARK_FILE="${DATA_DIR}/panel-public"
 CUSTOM_CERT="${DATA_DIR}/custom-cert.pem"
 CUSTOM_KEY="${DATA_DIR}/custom-key.pem"
+DUCKDNS_HOST_FILE="${DATA_DIR}/duckdns-host"
+DUCKDNS_TOKEN_FILE="${DATA_DIR}/duckdns-token"
+DUCKDNS_IP_FILE="${DATA_DIR}/duckdns-current-ip"
 CHANGED=0
 RESTART_REQUIRED=0
 
@@ -41,6 +46,8 @@ usage() {
 
 --domain ИМЯ         : панель по домену; запись A должна указывать на VPS.
 --ip АДРЕС           : явно задать публичный IPv4 вместо автоопределения.
+--duckdns ИМЯ        : подключить бесплатный поддомен ИМЯ.duckdns.org.
+--duckdns-token-file ПУТЬ : файл с токеном DuckDNS (хранение 0600).
 --cert-file ФАЙЛ     : использовать готовый TLS-сертификат (без ACME).
 --key-file ФАЙЛ      : приватный ключ готового сертификата.
 --ca-cert ФАЙЛ       : доверенный CA для проверки HTTPS (включая CI).
@@ -57,6 +64,8 @@ while (($#)); do
   case "$1" in
     --domain) (($# >= 2)) || fail 'укажите имя домена'; DOMAIN="$2"; shift 2 ;;
     --ip) (($# >= 2)) || fail 'укажите IPv4'; IP_OVERRIDE="$2"; shift 2 ;;
+    --duckdns) (($# >= 2)) || fail 'укажите поддомен DuckDNS'; DUCKDNS_HOST="$2"; shift 2 ;;
+    --duckdns-token-file) (($# >= 2)) || fail 'укажите путь к токену DuckDNS'; DUCKDNS_TOKEN_SOURCE="$2"; shift 2 ;;
     --cert-file) (($# >= 2)) || fail 'укажите файл сертификата'; CERT_FILE="$2"; shift 2 ;;
     --key-file) (($# >= 2)) || fail 'укажите файл ключа'; KEY_FILE="$2"; shift 2 ;;
     --ca-cert) (($# >= 2)) || fail 'укажите файл доверенного CA'; CA_CERT_FILE="$2"; shift 2 ;;
@@ -69,7 +78,9 @@ while (($#)); do
     *) fail "неизвестный параметр: $1" ;;
   esac
 done
-[[ -z "$DOMAIN" || -z "$IP_OVERRIDE" ]] || fail 'одновременно --domain и --ip недопустимы'
+[[ -z "$DOMAIN" || -z "$IP_OVERRIDE" || -n "$DUCKDNS_HOST" ]] || fail 'одновременно --domain и --ip недопустимы'
+[[ -z "$DOMAIN" || -z "$DUCKDNS_HOST" ]] || fail 'используйте либо --domain, либо --duckdns'
+[[ -z "$DUCKDNS_TOKEN_SOURCE" || -n "$DUCKDNS_HOST" ]] || fail '--duckdns-token-file допускается только с --duckdns'
 [[ -z "$CERT_FILE" && -z "$KEY_FILE" || -n "$CERT_FILE" && -n "$KEY_FILE" ]] || fail '--cert-file и --key-file нужны вместе'
 [[ -z "$CA_CERT_FILE" || -n "$CERT_FILE" ]] || fail '--ca-cert применяется с --cert-file'
 if [[ -n "$CERT_FILE" ]]; then
@@ -118,10 +129,26 @@ validate_domain() {
   [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$ && "$1" == *.* && ${#1} -le 253 ]] || fail 'некорректное имя домена'
 }
 
+validate_duckdns() {
+  local name="$1"
+  [[ "$name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] ||
+    fail 'некорректное имя DuckDNS'
+}
+duckdns_name() {
+  local name="$1"
+  name="${name%.duckdns.org}"
+  validate_duckdns "$name"
+  printf '%s\n' "${name,,}"
+}
 get_target() {
-  if [[ -n "$DOMAIN" ]]; then
+  if [[ -n "$DUCKDNS_HOST" ]]; then
+    TARGET_MODE='domain'
+    TARGET_HOST="$(duckdns_name "$DUCKDNS_HOST").duckdns.org"
+  elif [[ -n "$DOMAIN" ]]; then
     validate_domain "$DOMAIN"
     TARGET_MODE='domain'; TARGET_HOST="$DOMAIN"
+  elif [[ -f "$DUCKDNS_HOST_FILE" && -s "$DUCKDNS_TOKEN_FILE" ]]; then
+    TARGET_MODE='domain'; TARGET_HOST="$(cat "$DUCKDNS_HOST_FILE")"
   elif [[ -n "$IP_OVERRIDE" ]]; then
     is_public_ipv4 "$IP_OVERRIDE" || fail 'нужен публичный IPv4'
     TARGET_MODE='ip'; TARGET_HOST="$IP_OVERRIDE"
@@ -131,6 +158,29 @@ get_target() {
   else
     TARGET_MODE='ip'; TARGET_HOST="$(detect_ip)" || fail 'не удалось узнать публичный IPv4; укажите --ip'
   fi
+}
+# Токен не помещаем в аргументы URL и не выводим в логи.
+update_duckdns() {
+  [[ -s "$DUCKDNS_HOST_FILE" && -s "$DUCKDNS_TOKEN_FILE" ]] || return 0
+  local current_ip="$1" previous name response
+  is_public_ipv4 "$current_ip" || fail 'DuckDNS: некорректный публичный IPv4'
+  previous="$(cat "$DUCKDNS_IP_FILE" 2>/dev/null || true)"
+  if [[ "$previous" == "$current_ip" ]]; then
+    log "DuckDNS: адрес не менялся ($current_ip)"
+    return 0
+  fi
+  name="$(cat "$DUCKDNS_HOST_FILE")"
+  name="${name%.duckdns.org}"
+  response="$(curl --fail --silent --show-error --get --max-time 12 \
+    --data-urlencode "domains=$name" \
+    --data-urlencode "token@$DUCKDNS_TOKEN_FILE" \
+    --data-urlencode "ip=$current_ip" \
+    'https://www.duckdns.org/update')" || fail 'DuckDNS: не удалось обратиться к API'
+  [[ "${response//$'\n'/}" == OK ]] || fail 'DuckDNS: API вернул ошибку (проверьте домен и токен)'
+  printf '%s\n' "$current_ip" > "${DUCKDNS_IP_FILE}.new"
+  chmod 0600 "${DUCKDNS_IP_FILE}.new"
+  mv -f "${DUCKDNS_IP_FILE}.new" "$DUCKDNS_IP_FILE"
+  log "DuckDNS: $name.duckdns.org → $current_ip"
 }
 
 # Обновление сертификата: выполняется только если IP действительно поменялся.
