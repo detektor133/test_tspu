@@ -6,11 +6,20 @@ umask 077
 
 HOST="${1:?укажите адрес тестового сервера}"
 CA="${2:?укажите тестовый CA}"
+INSTANCE="${3:-1}"
+[[ "$INSTANCE" =~ ^[12]$ ]] || { echo "E2E: нужен номер прогона 1 или 2" >&2; exit 1; }
+MIXED_PORT=$((17890 + INSTANCE))
+CTRL_PORT=$((19090 + INSTANCE))
+export MIXED_PORT CTRL_PORT
 ROOT="$(mktemp -d)"
 CHILD_PID=''
 ORIGIN_PID=''
 cleanup() {
   [[ -z "$CHILD_PID" ]] || kill "$CHILD_PID" >/dev/null 2>&1 || true
+  # sudo может оставить дочерний процесс Mihomo после завершения оболочки.
+  # Выбираем строго процесс с временной директорией ЭТОГО теста.
+  sudo pgrep -f "^/usr/local/m-ui/mihomo -d ${ROOT}/client-home " 2>/dev/null |
+    xargs -r sudo kill -TERM 2>/dev/null || true
   [[ -z "$ORIGIN_PID" ]] || kill "$ORIGIN_PID" >/dev/null 2>&1 || true
   rm -rf "$ROOT"
 }
@@ -116,10 +125,10 @@ for x in proxies:
         if x.get('type') == 'vless':
             x['servername']=host
     # REALITY оставляет внешний проверенный SNI, UUID и public key без изменений.
-config['mixed-port']=17891
+config['mixed-port']=int(os.environ['MIXED_PORT'])
 config['allow-lan']=False
 config['mode']='rule'
-config['external-controller']='127.0.0.1:19091'
+config['external-controller']='127.0.0.1:'+os.environ['CTRL_PORT']
 config['secret']='ci-local-only'
 config['log-level']='warning'
 config['proxy-groups']=[{'name':'E2E', 'type':'select',
@@ -151,7 +160,7 @@ ready=0
 for _ in {1..35}; do
   if curl --silent --fail --noproxy '*' --max-time 1 \
     -H 'Authorization: Bearer ci-local-only' \
-    'http://127.0.0.1:19091/proxies/E2E' >/dev/null; then
+    "http://127.0.0.1:${CTRL_PORT}/proxies/E2E" >/dev/null; then
     ready=1
     break
   fi
@@ -171,13 +180,13 @@ PY
   curl --noproxy '*' --silent --show-error --fail --max-time 4 \
     --request PUT --header 'Authorization: Bearer ci-local-only' \
     --header 'Content-Type: application/json' \
-    --data "$payload" "http://127.0.0.1:19091/proxies/E2E" >/dev/null ||
+    --data "$payload" "http://127.0.0.1:${CTRL_PORT}/proxies/E2E" >/dev/null ||
       fatal "не получилось выбрать $kind/$port"
   ok=0
   for _ in {1..2}; do
     if curl --noproxy '' --silent --show-error --fail \
       --connect-timeout 3 --max-time 8 \
-      --proxy 'http://127.0.0.1:17891' \
+      --proxy "http://127.0.0.1:${MIXED_PORT}" \
       'http://127.0.0.1:18180/probe' 2>/dev/null |
       grep -Fxq 'tspu-e2e-through-mihomo'; then
       ok=1
