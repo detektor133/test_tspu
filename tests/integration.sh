@@ -78,6 +78,26 @@ assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "8.8.8.8"
 assert_eq "$(sudo cat /var/lib/test-tspu/cert-mode)" "custom"
 check_https 8.8.8.8
 
+log "Доступ к панели: защищённый вывод только в интерактивном SSH-терминале"
+# Команда получения доступа не должна менять установленное состояние.
+pid_access_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
+sudo bash deploy.sh --show-access >"$TMP/noninteractive-access.log"
+grep -q 'пароль не выводится в логи' "$TMP/noninteractive-access.log"
+if sudo grep -Fq -f /var/lib/test-tspu/panel-password "$TMP/noninteractive-access.log"; then
+  echo 'Пароль панели утёк в неинтерактивный лог' >&2; exit 1
+fi
+if sudo grep -Fq -f /var/lib/test-tspu/panel-password "$TMP/install.log"; then
+  echo 'Пароль панели утёк в лог автоматической установки' >&2; exit 1
+fi
+# script выделяет псевдотерминал. Вывод сохраняем в закрытый временный
+# файл runner и никогда не печатаем в CI, поскольку там настоящий пароль.
+sudo script -q -c 'bash deploy.sh --show-access' /dev/null >"$TMP/terminal-access.log"
+grep -q 'Панель: https://8.8.8.8:2053/' "$TMP/terminal-access.log"
+sudo grep -Fq -f /var/lib/test-tspu/panel-user "$TMP/terminal-access.log"
+sudo grep -Fq -f /var/lib/test-tspu/panel-password "$TMP/terminal-access.log"
+assert_eq "$(sudo systemctl show -p MainPID --value m-ui.service)" "$pid_access_before"
+log 'Адрес/логин/пароль доступны в терминале; в CI-логи пароль не попал'
+
 log "Проверка создания inbounds в панели и прослушивания портов"
 sudo python3 - <<'PY'
 import json
