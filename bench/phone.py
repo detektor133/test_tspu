@@ -153,6 +153,17 @@ def run(a):
                 nodes[label] = node
     if not nodes:
         raise SystemExit("В подписке нет профилей для указанного VPS")
+    # Каждый запрошенный уровень должен иметь шанс задействовать ВСЕ потоки.
+    # Иначе ранние протоколы съедят бюджет, а тесты в 32/64 потока превратятся
+    # в фиктивные тесты с 1-2 реальными запросами.
+    total_requests = (a.max_mib * 1024 * 1024) // 262144
+    min_requests = len(nodes) * sum(levels)
+    if total_requests < min_requests:
+        import math
+        needed = math.ceil(min_requests * 262144 / (1024 * 1024))
+        raise SystemExit(
+            "Недостаточно лимита для проверки всех профилей на заданных уровнях. "
+            "Требуется --max-mib не меньше %d либо уменьшите --levels." % needed)
     names = [n["name"] for n in nodes.values()]
     if len(names) != len(set(names)):
         raise SystemExit("Одинаковые имена прокси: API не сможет выбирать их однозначно")
@@ -192,6 +203,7 @@ def run(a):
     rows = []
     remote_error = ""
     budget = int(a.max_mib * 1024 * 1024 // 262144)
+    future_levels = [level for _, label in PORTS if label in nodes for level in levels]
     started_at = now()
     try:
         run_ssh(dest, a.ssh_port, "mkdir -m 700 -p " + remote)
@@ -235,15 +247,23 @@ def run(a):
                     raise RuntimeError("Mihomo не подтвердил выбранный профиль")
             except Exception as exc:
                 rows.append(fail_row(a.network, label, name, "switch_error", str(type(exc).__name__)))
+                for skipped in levels:
+                    if future_levels and future_levels[0] == skipped:
+                        future_levels.pop(0)
                 continue
             for level in levels:
-                if budget <= 0:
-                    rows.append(fail_row(a.network, label, name, "budget_exhausted",
-                                         "Достигнут лимит мобильного трафика"))
-                    break
+                if not future_levels or future_levels[0] != level:
+                    raise RuntimeError("Внутренняя ошибка распределения лимита по уровням")
+                future_levels.pop(0)
+                required_later = sum(future_levels)
+                # Минимум level запросов для текущего теста, плюс равная доля
+                # свободных запросов; будущие уровни гарантированно сохранят квоту.
+                spare = max(0, budget - required_later - level)
+                quota = level + spare // (len(future_levels) + 1)
+                quota = min(quota, budget - required_later)
                 t0 = now()
                 measurement = run_level(target, proxy, level, a.seconds, a.timeout,
-                                        262144, expected, 262144, max_requests=budget)
+                                        262144, expected, 262144, max_requests=quota)
                 t1 = now()
                 budget -= measurement["requests_total"]
                 row = {"network": a.network, "protocol": label,
@@ -308,7 +328,7 @@ def main():
     run_p.add_argument("--levels", default="1,8,32,64")
     run_p.add_argument("--seconds", type=float, default=6)
     run_p.add_argument("--timeout", type=float, default=10)
-    run_p.add_argument("--max-mib", type=int, default=128,
+    run_p.add_argument("--max-mib", type=int, default=256,
                        help="верхний предел полезной нагрузки в МиБ")
     run_p.add_argument("--output", help="приватный каталог для CSV/отчёта")
     a = p.parse_args()
