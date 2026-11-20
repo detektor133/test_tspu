@@ -39,7 +39,7 @@ PORTS = [
 ]
 CSV_FIELDS = ["network", "protocol", "proxy_name", "status", "error",
               "route_status", "route_port", "route_packets", "route_ip_bytes",
-              "unexpected_port_packets", "cumulative_mib"] + HEADERS
+              "unexpected_port_packets", "cumulative_mib", "protocol_cumulative_mib"] + HEADERS
 SAMPLE_FIELDS = ["network", "protocol", "concurrency", "started_utc", "ended_utc",
                  "ok", "bytes_ok", "ttfb_ms", "latency_ms", "error_type", "nonce"]
 TRANSPORT = {"VLESS REALITY": "tcp", "VLESS XHTTP": "tcp",
@@ -308,6 +308,7 @@ def run(a):
                                      "Профиля с этим портом нет в подписке"))
                 continue
             name = node["name"]
+            protocol_bytes_ok = 0
             try:
                 api("PUT", "/proxies/FIELD", ctrl_secret, {"name": name})
                 selected = api("GET", "/proxies/FIELD", ctrl_secret)
@@ -345,6 +346,7 @@ def run(a):
                     samples.append({"network": a.network, "protocol": label,
                                     "concurrency": level, **record})
                 budget -= measurement["requests_total"]
+                protocol_bytes_ok += measurement["bytes_ok"]
                 # Functional success is not automatically a valid sustained benchmark.
                 if not measurement["requests_ok"]:
                     quality = "failed"
@@ -362,6 +364,7 @@ def run(a):
                        "ended_utc": t1, "label": a.network + " / " + label,
                        "concurrency": level, "seconds_configured": a.seconds,
                        "cumulative_mib": round((a.max_mib * 4 - budget) / 4, 2),
+                       "protocol_cumulative_mib": round(protocol_bytes_ok / (1024 ** 2), 2),
                        **route, **measurement}
                 rows.append(row)
                 p95 = ("%.0f мс" % row["latency_p95_ms"]
