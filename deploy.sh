@@ -24,6 +24,7 @@ PANEL_USER_OVERRIDE=''
 PANEL_PASSWORD_SOURCE=''
 NO_INBOUNDS=0
 REALITY_TARGET=''
+UI_LANGUAGE=''
 SELF_PATH='/usr/local/sbin/test-tspu-deploy'
 INSTALLER_CACHE="${DATA_DIR}/m-ui-upstream-install.sh"
 HOST_FILE="${DATA_DIR}/panel-host"
@@ -58,6 +59,8 @@ usage() {
 --panel-password-file ПУТЬ : пароль существующей m-ui (без смены пароля).
 --panel-user ИМЯ : логин существующей m-ui; по умолчанию из настроек.
 --reality-target ИМЯ : заданный проверяемый TLS-сайт маскировки REALITY.
+--ui-language ru|en   : язык панели (по умолчанию русский при первой установке).
+                      При повторном запуске без флага выбор пользователя сохраняется.
 --no-inbounds : не создавать новые подключения; управление только панелью.
 --cert-file ФАЙЛ     : использовать готовый TLS-сертификат (без ACME).
 --key-file ФАЙЛ      : приватный ключ готового сертификата.
@@ -82,6 +85,7 @@ while (($#)); do
     --panel-password-file) (($# >= 2)) || fail 'укажите файл пароля m-ui'; PANEL_PASSWORD_SOURCE="$2"; shift 2 ;;
     --panel-user) (($# >= 2)) || fail 'укажите логин m-ui'; PANEL_USER_OVERRIDE="$2"; shift 2 ;;
     --reality-target) (($# >= 2)) || fail 'укажите TLS-сайт'; REALITY_TARGET="$2"; shift 2 ;;
+    --ui-language|--language) (($# >= 2)) || fail 'укажите язык панели: ru или en'; UI_LANGUAGE="$2"; shift 2 ;;
     --no-inbounds) NO_INBOUNDS=1; shift ;;
     --cert-file) (($# >= 2)) || fail 'укажите файл сертификата'; CERT_FILE="$2"; shift 2 ;;
     --key-file) (($# >= 2)) || fail 'укажите файл ключа'; KEY_FILE="$2"; shift 2 ;;
@@ -107,6 +111,7 @@ if [[ -n "$CERT_FILE" ]]; then
 fi
 [[ -z "$CA_CERT_FILE" || -s "$CA_CERT_FILE" && -r "$CA_CERT_FILE" ]] || fail 'файл CA недоступен'
 [[ -z "$PANEL_PASSWORD_SOURCE" || -r "$PANEL_PASSWORD_SOURCE" && -s "$PANEL_PASSWORD_SOURCE" ]] || fail 'файл пароля m-ui недоступен'
+[[ -z "$UI_LANGUAGE" || "$UI_LANGUAGE" == ru || "$UI_LANGUAGE" == en ]] || fail 'язык панели должен быть ru или en'
 
 is_ipv4() {
   local ip="$1" a b c d v
@@ -787,6 +792,97 @@ if [[ ! -f "$PUBLIC_MARK_FILE" ]] || (( !PUBLIC_LISTEN )); then
   fi
   printf '%s\n' '0.0.0.0' > "$PUBLIC_MARK_FILE"
   change 'GUI слушает публичный интерфейс по HTTPS'
+fi
+
+# Язык меняем через официальный API m-ui: без редактирования state.json вручную
+# и без перезапуска сервиса/ядра. Настройки пользователя при обычном повторном
+# запуске НЕ перезаписываем; русифицируем только новую панель по умолчанию.
+DESIRED_LANGUAGE="$UI_LANGUAGE"
+if ((PANEL_BOOTSTRAP)) && [[ -z "$DESIRED_LANGUAGE" ]]; then
+  DESIRED_LANGUAGE='ru'
+fi
+if [[ -n "$DESIRED_LANGUAGE" ]]; then
+  if [[ -n "$PANEL_PASSWORD_SOURCE" ]]; then
+    UI_PASS_FILE="$PANEL_PASSWORD_SOURCE"
+  else
+    UI_PASS_FILE="$PANEL_PASS_FILE"
+  fi
+  [[ -s "$UI_PASS_FILE" ]] ||
+    fail 'для настройки языка существующей панели нужен --panel-password-file /root/m-ui-password'
+  if [[ -n "$PANEL_USER_OVERRIDE" ]]; then
+    UI_USER="$PANEL_USER_OVERRIDE"
+  elif [[ -s "$PANEL_USER_FILE" ]]; then
+    UI_USER="$(cat "$PANEL_USER_FILE")"
+  else
+    UI_USER="$("$PANEL_PATH" settings --data-dir "$PANEL_DATA" | sed -n 's/^username: //p' | head -n1)"
+  fi
+  [[ -n "$UI_USER" ]] || fail 'не удалось определить логин для настройки языка'
+  export DESIRED_LANGUAGE TARGET_HOST CA_CERT_FILE UI_PASS_FILE UI_USER
+  export UI_COOKIE_FILE="${TMP_DIR}/ui-lang.cookies"
+  LANG_CHANGE="$(python3 - <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import time
+
+state_file = pathlib.Path('/usr/local/m-ui/data/state.json')
+state = json.loads(state_file.read_text())
+desired = os.environ['DESIRED_LANGUAGE']
+if state['settings'].get('language') == desired:
+    print('unchanged')
+    raise SystemExit(0)
+
+host = os.environ['TARGET_HOST']
+path = '/' + state['settings']['panelPath'].strip('/') + '/'
+cookie_file = os.environ['UI_COOKIE_FILE']
+password = pathlib.Path(os.environ['UI_PASS_FILE']).read_text().strip()
+if not password:
+    raise SystemExit('Пустой пароль панели')
+
+def request(endpoint, payload, retries=1):
+    argv = ['curl', '--silent', '--show-error', '--fail-with-body',
+            '--connect-timeout', '3', '--max-time', '12', '--noproxy', '*',
+            '--resolve', f'{host}:2053:127.0.0.1',
+            '--cookie', cookie_file, '--cookie-jar', cookie_file,
+            '--header', 'Content-Type: application/json',
+            '--request', 'POST', '--data-binary', '@-']
+    if os.environ.get('CA_CERT_FILE'):
+        argv.extend(['--cacert', os.environ['CA_CERT_FILE']])
+    argv.append(f'https://{host}:2053{path}{endpoint}')
+    for attempt in range(retries):
+        result = subprocess.run(argv, input=json.dumps(payload),
+                                capture_output=True, text=True, timeout=16)
+        if result.returncode == 0 or result.returncode == 22:
+            break
+        if attempt + 1 < retries:
+            time.sleep(0.25)
+    if result.returncode != 0:
+        raise RuntimeError(f'{endpoint}: HTTPS/API вернул ошибку; код curl={result.returncode}')
+    try:
+        response = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError(f'{endpoint}: неверный JSON ответа') from exc
+    if not response.get('ok', False):
+        raise RuntimeError(f'{endpoint}: m-ui отклонила запрос')
+    return response.get('data') or {}
+
+request('api/auth/login',
+        {'username': os.environ['UI_USER'], 'password': password}, retries=12)
+result = request('api/language', {'language': desired})
+if result.get('language') != desired:
+    raise SystemExit('m-ui не подтвердила изменение языка')
+saved = json.loads(state_file.read_text())['settings'].get('language')
+if saved != desired:
+    raise SystemExit('m-ui не сохранила язык в state.json')
+print('changed')
+PY
+)" || fail 'не удалось установить язык интерфейса через API m-ui'
+  if [[ "$LANG_CHANGE" == changed ]]; then
+    change "язык интерфейса m-ui: $DESIRED_LANGUAGE"
+  else
+    log "Без изменений: язык интерфейса m-ui: $DESIRED_LANGUAGE"
+  fi
 fi
 
 # Создаём только отсутствующие inbounds через API m-ui — state.json и config.yaml не редактируем.
