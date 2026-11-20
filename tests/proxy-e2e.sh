@@ -2,8 +2,6 @@
 # Настоящий клиент Mihomo подключается к запущенным inbound того же runner.
 # Публичный VPS не требуется; TLS проверяется через тестовый CA.
 set -Eeuo pipefail
-# shellcheck disable=SC2024
-# Логи пишутся пользователем runner, а Mihomo выполняется от root.
 umask 077
 
 HOST="${1:?укажите адрес тестового сервера}"
@@ -115,10 +113,12 @@ python3 -m http.server 18180 --bind 127.0.0.1 --directory "$ROOT/origin" \
   > "$ROOT/origin.log" 2>&1 &
 ORIGIN_PID=$!
 
+# shellcheck disable=SC2024
 sudo /usr/local/m-ui/mihomo -d "$ROOT/client-home" -t -f "$ROOT/client.yaml" \
   > "$ROOT/validate.log" 2>&1 ||
     fatal 'невалидная клиентская конфигурация Mihomo'
 
+# shellcheck disable=SC2024
 sudo /usr/local/m-ui/mihomo -d "$ROOT/client-home" -f "$ROOT/client.yaml" \
   > "$ROOT/client.log" 2>&1 &
 CHILD_PID=$!
