@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Интеграционные тесты на временном GitHub Actions runner, без VPS и Let's Encrypt.
 set -Eeuo pipefail
+# shellcheck disable=SC2024
+# Перенаправление выполняет runner: временные логи должны принадлежать ему, не root.
 umask 077
 cd "$(dirname "$0")/.."
 
