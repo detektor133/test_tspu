@@ -906,6 +906,19 @@ tuic_pw = get_secret(tuicname, 'password', token)
 add({'name': tuicname, 'type': 'tuic', 'port': 8443, 'listen': '0.0.0.0',
      'users': {tuic_uuid: tuic_pw}, 'alpn': ['h3'], 'congestion-controller': 'bbr',
      'certificate': crt, 'private-key': key})
+# TUIC аутентифицируется по UUID, но для общей подписки нужен username test.
+# Меняем только автосозданный профиль: UUID и пароль не затрагиваем.
+for item in api('GET', 'api/inbounds') or []:
+    if item.get('name') != tuicname:
+        continue
+    for client in item.get('clients') or []:
+        if client.get('uuid') != tuic_uuid or client.get('username') != tuic_uuid:
+            continue
+        client['username'] = 'test'
+        client['name'] = 'test'
+        api('POST', 'api/inbounds', item)
+        print('TUIC: автоклиент объединён с подпиской test; UUID сохранён')
+    break
 
 trname = 'test-tspu-trojan'
 trpw = get_secret(trname, 'password', token)
