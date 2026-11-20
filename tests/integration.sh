@@ -78,6 +78,12 @@ assert_eq "$(sudo cat /var/lib/test-tspu/panel-host)" "8.8.8.8"
 assert_eq "$(sudo cat /var/lib/test-tspu/cert-mode)" "custom"
 check_https 8.8.8.8
 
+log "Новая панель по умолчанию на русском"
+assert_eq "$(sudo python3 -c 'import json; print(json.load(open("/usr/local/m-ui/data/state.json"))["settings"]["language"])')" "ru"
+grep -q 'data-default-language="ru"' "$TMP/panel.html" || {
+  echo 'Сервер не отдал русский язык на странице входа' >&2; exit 1;
+}
+
 log "Доступ к панели: защищённый вывод только в интерактивном SSH-терминале"
 # Команда получения доступа не должна менять установленное состояние.
 pid_access_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
@@ -163,6 +169,20 @@ api_code="$(curl --silent --show-error --noproxy '*' \
   --max-time 6 -o /dev/null -w '%{http_code}' "https://8.8.8.8:2053$panel_uri")"
 assert_eq "$api_code" 401
 
+log "Язык существующей панели: выбор en без перезапуска и без изменения inbounds"
+pid_lang_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
+subscriptions_lang_before="$(sudo sha256sum /var/lib/test-tspu/subscriptions.txt | awk '{print $1}')"
+run_root bash deploy.sh --ip 8.8.8.8 --no-inbounds --ui-language en >"$TMP/language-en.log" 2>&1 || {
+  cat "$TMP/language-en.log"; exit 1;
+}
+assert_eq "$(sudo python3 -c 'import json; print(json.load(open("/usr/local/m-ui/data/state.json"))["settings"]["language"])')" "en"
+assert_eq "$(sudo systemctl show -p MainPID --value m-ui.service)" "$pid_lang_before"
+assert_eq "$(sudo sha256sum /var/lib/test-tspu/subscriptions.txt | awk '{print $1}')" "$subscriptions_lang_before"
+check_https 8.8.8.8
+grep -q 'data-default-language="en"' "$TMP/panel.html" || {
+  echo 'Сервер не отдал английский язык на странице входа' >&2; exit 1;
+}
+
 log "Повторный деплой: отсутствие изменений и прежний PID"
 pid_before="$(sudo systemctl show -p MainPID --value m-ui.service)"
 subscriptions_before="$(sudo sha256sum /var/lib/test-tspu/subscriptions.txt | awk '{print $1}')"
@@ -181,6 +201,23 @@ if ! grep -q 'Итог: без изменений' "$TMP/repeat.log"; then
   exit 1
 fi
 check_https 8.8.8.8
+assert_eq "$(sudo python3 -c 'import json; print(json.load(open("/usr/local/m-ui/data/state.json"))["settings"]["language"])')" "en"
+
+log "Явный возврат на русский: без смены пароля, токенов и PID"
+run_root bash deploy.sh --ip 8.8.8.8 --ui-language ru >"$TMP/language-ru.log" 2>&1 || {
+  cat "$TMP/language-ru.log"; exit 1;
+}
+assert_eq "$(sudo python3 -c 'import json; print(json.load(open("/usr/local/m-ui/data/state.json"))["settings"]["language"])')" "ru"
+assert_eq "$(sudo systemctl show -p MainPID --value m-ui.service)" "$pid_lang_before"
+assert_eq "$(sudo sha256sum /var/lib/test-tspu/subscriptions.txt | awk '{print $1}')" "$subscriptions_lang_before"
+check_https 8.8.8.8
+grep -q 'data-default-language="ru"' "$TMP/panel.html"
+run_root bash deploy.sh --ip 8.8.8.8 --ui-language ru >"$TMP/language-repeat.log" 2>&1 || {
+  cat "$TMP/language-repeat.log"; exit 1;
+}
+grep -q 'Итог: без изменений' "$TMP/language-repeat.log" || {
+  echo 'Повторная установка того же языка не должна изменять систему' >&2; exit 1;
+}
 
 log "Восстановление удалённой конфигурации без переустановки"
 sudo rm /etc/systemd/system/m-ui.service.d/90-test-tspu.conf
