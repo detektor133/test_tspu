@@ -41,12 +41,15 @@ def attach_evidence(folder, rows):
     except (OSError, ValueError, AttributeError):
         controls_passed = False
     groups = {}
+    ping_groups = {}
     for sample in samples:
         key = (sample.get("protocol"), str(sample.get("concurrency")))
-        groups.setdefault(key, []).append(sample)
+        (ping_groups if sample.get("kind") == "ping" else groups).setdefault(
+            key, []).append(sample)
     for row in rows:
         key = (row.get("protocol"), str(row.get("concurrency")))
         part = groups.get(key, [])
+        ping_part = ping_groups.get(key, [])
         try:
             complete = (len(part) == int(row.get("requests_total") or 0)
                         and len(part) > 0
@@ -54,7 +57,13 @@ def attach_evidence(folder, rows):
                             int(row.get("requests_ok") or 0)
                         and sum(int(v.get("bytes_ok") or 0) for v in part) ==
                             int(row.get("bytes_ok") or 0)
-                        and all(v.get("nonce") and len(v["nonce"]) == 24 for v in part))
+                        and all(v.get("nonce") and len(v["nonce"]) == 24 for v in part)
+                        and len(ping_part) ==
+                            int(row.get("app_rtt_samples") or 0) +
+                            int(row.get("app_rtt_failed") or 0)
+                        and sum(int(v.get("ok") or 0) for v in ping_part) ==
+                            int(row.get("app_rtt_samples") or 0)
+                        and all(v.get("nonce") and len(v["nonce"]) == 24 for v in ping_part))
         except (TypeError, ValueError):
             complete = False
         row["raw_samples_complete"] = complete
@@ -74,6 +83,8 @@ def valid_level(row):
                 and float(row.get("seconds_elapsed") or 0) >= float(row["seconds_configured"]) - .01
                 and int(float(row.get("latency_samples") or 0)) >= 20
                 and int(float(row.get("requests_ok") or 0)) >= 20
+                and int(float(row.get("app_rtt_samples") or 0)) >= 20
+                and row.get("app_rtt_p95_ms") not in ("", None)
                 and row.get("route_status") == "verified"
                 and int(float(row.get("route_packets") or 0)) > 0
                 and row.get("raw_samples_complete") is True
@@ -159,20 +170,28 @@ def generate(folder):
         by_label[label] = tested
         if not tested:
             reason = group[0].get("status", "не измерялся") if group else "не измерялся"
-            reported.append("| %s | — | — | — | — | — | — | — | %s |" % (label, reason))
+            reported.append("| " + " | ".join([label] + ["—"] * 10 + [reason]) + " |")
             continue
         for r in tested:
             res = resources_for(r, resources)
-            reported.append("| %s | %s | %s/%s | %s/%s | %s | %s | %s | %s | %s |" %
-                            (label, r.get("concurrency", "—"), r.get("requests_ok", "0"),
-                             r.get("requests_total", "0"),
-                             metric(r.get("seconds_elapsed"), 2), metric(r.get("seconds_configured"), 2),
-                             metric(r.get("throughput_mib_s"), 3),
-                             metric(r.get("latency_p95_ms")),
-                             cell(res["cpu_peak"] if res else None),
-                             cell(res["rss_peak"] if res else None),
-                             (r.get("status", "?") if r.get("status") != "ok" or valid_level(r)
-                              else "unverified_legacy")))
+            status_label = (r.get("status", "?") if r.get("status") != "ok" or valid_level(r)
+                            else "unverified_legacy")
+            reported.append("| " + " | ".join([
+                label, str(r.get("concurrency") or "—"),
+                str(r.get("requests_ok") or "0") + "/" +
+                str(r.get("requests_total") or "0"),
+                metric(r.get("seconds_elapsed"), 2) + "/" +
+                metric(r.get("seconds_configured"), 2),
+                metric(r.get("throughput_mib_s"), 3),
+                metric(r.get("app_rtt_p95_ms")),
+                metric(r.get("latency_p95_ms")),
+                str(r.get("route_port") or "—") + " (" +
+                str(r.get("route_packets") or "0") + " пак.)",
+                metric(r.get("protocol_cumulative_mib"), 2),
+                cell(res["cpu_peak"] if res else None),
+                cell(res["rss_peak"] if res else None),
+                status_label,
+            ]) + " |")
     totals = {label: sum(int(num(r.get("requests_total"))) for r in group)
               for label, group in by_label.items()}
     successful = {label: sum(int(num(r.get("requests_ok"))) for r in group)
@@ -221,7 +240,8 @@ def generate(folder):
     notes.extend([
         "Тип доступа к сети указал пользователь; скрипт не доказывает, что Android реально использовал именно эту сеть.",
         "Проверен трафик через туннель к loopback-HTTP на собственном VPS; это не скорость стороннего сайта.",
-        "TTFB и полное время ответа не равны сетевому RTT. Отдельный RTT не измерялся.",
+        "HTTP /ping под одновременной нагрузкой измеряет прикладную задержку до origin; "
+        "это не ICMP RTT. p95 загрузки 256 КиБ измеряется отдельно.",
         "budget_limited: бюджет кончился раньше таймера; скорость за фактический интервал "
         "не является устойчивой скоростью за заданные секунды.",
         "insufficient_samples: до конца таймера дошли, но получено меньше 20 успешных ответов; "
@@ -272,12 +292,12 @@ def generate(folder):
 |---|---:|---:|
 {summary}
 
-| Протокол | Потоки | OK/все | Факт/план, с | МиБ/с | p95 полного ответа, мс | CPU Mihomo peak, % ядра | RSS peak, МиБ | Статус |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Протокол | Потоки | OK/все | Факт/план, с | МиБ/с | HTTP ping p95, мс | Загрузка 256 КиБ p95, мс | Порт VPS (вх. пакеты) | Накоплено протоколом, МиБ | CPU Mihomo peak, % ядра | RSS peak, МиБ | Статус |
+|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
 {details}
 
 100% CPU = одно занятое логическое ядро; это не процент всех ядер VPS.
-Статус `ok` означает, что плановая длительность выдержана и есть >=20 успешных ответов. `budget_limited` означает завершение из-за лимита до таймера; `insufficient_samples` — слишком мало успешных ответов. Строки с этими статусами полезны как функциональная проверка, но НЕ сопоставимы как полноценный нагрузочный тест. p95 доступен только при >=20 успешных ответах, p99 — при >=100. Недоступные метрики указаны «—», а не нулём.
+Статус `ok` означает, что плановая длительность выдержана, подтверждён корректный порт VPS и отрицательные контроли, и есть >=20 успешных скачиваний и HTTP ping. `budget_limited` означает завершение из-за лимита до таймера; `insufficient_samples` — слишком мало успешных ответов. Строки с этими статусами полезны как функциональная проверка, но НЕ сопоставимы как полноценный нагрузочный тест. p95 доступен только при >=20 успешных ответах, p99 — при >=100. Недоступные метрики указаны «—», а не нулём.
 
 ![Скорость (только подтверждённые полные интервалы)](charts/throughput.svg)
 
