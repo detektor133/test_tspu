@@ -26,6 +26,22 @@ def num(value):
         return 0.0
 
 
+def valid_level(row):
+    """A full timed observation with enough responses for a p95 estimate.
+
+    Legacy CSVs without timing/sample metadata must not masquerade as validated.
+    """
+    try:
+        return (row.get("status") == "ok"
+                and row.get("measurement_status") == "time_completed"
+                and float(row.get("seconds_configured") or 0) > 0
+                and float(row.get("seconds_elapsed") or 0) >= float(row["seconds_configured"]) - .01
+                and int(float(row.get("latency_samples") or 0)) >= 20
+                and int(float(row.get("requests_ok") or 0)) >= 20)
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
 def metric(value, precision=1):
     if value is None or value == '':
         return '—'
@@ -114,20 +130,21 @@ def generate(folder):
                              metric(r.get("latency_p95_ms")),
                              cell(res["cpu_peak"] if res else None),
                              cell(res["rss_peak"] if res else None),
-                             r.get("status", "?")))
+                             (r.get("status", "?") if r.get("status") != "ok" or valid_level(r)
+                              else "unverified_legacy")))
     totals = {label: sum(int(num(r.get("requests_total"))) for r in group)
               for label, group in by_label.items()}
     successful = {label: sum(int(num(r.get("requests_ok"))) for r in group)
                   for label, group in by_label.items()}
     transferred = {label: sum(int(num(r.get("bytes_ok"))) for r in group)
                    for label, group in by_label.items()}
-    good = [x for label in ORDER for x in by_label[label] if x.get("status") == "ok"]
-    quality_issues = [x for label in ORDER for x in by_label[label] if x.get("status") != "ok"]
+    good = [x for label in ORDER for x in by_label[label] if valid_level(x)]
+    quality_issues = [x for label in ORDER for x in by_label[label] if not valid_level(x)]
     throughput = [(label, max((num(r.get("throughput_mib_s")) for r in by_label[label]
-                               if r.get("status") == "ok" and r.get("latency_p95_ms") not in (None, '')), default=0.0))
+                               if valid_level(r)), default=0.0))
                   for label in ORDER]
     latency = [(label, min((num(r.get("latency_p95_ms")) for r in by_label[label]
-                            if r.get("status") == "ok"), default=0.0))
+                            if valid_level(r) and r.get("latency_p95_ms") not in ('', None)), default=0.0))
                for label in ORDER]
     # Zero on a chart means "no successful observation" rather than a measured 0 ms.
     charts = folder / "charts"
@@ -144,7 +161,8 @@ def generate(folder):
     if absent:
         notes.append("Не измерены или недоступны профили: " + ", ".join(absent) + ".")
     if quality_issues:
-        notes.append("Часть уровней имеет статус budget_limited, insufficient_samples или failed: "
+        notes.append("Часть уровней имеет статус budget_limited, insufficient_samples, failed "
+                     "или unverified_legacy (старый CSV без метаданных): "
                      "это проверка передачи данных, но не подтверждённый бенчмарк заданной длительности. "
                      "Они исключены из графиков сравнимой скорости/задержки.")
     if not resources:
