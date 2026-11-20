@@ -513,10 +513,16 @@ while IFS='=' read -r key value; do
   fi
 done < "${TMP_DIR}/tuning.conf"
 if ((TUNING_CHANGED || SYSCTL_DRIFT)); then
-  if ! sysctl -p "$TUNING_FILE"; then
-    log 'ПРЕДУПРЕЖДЕНИЕ: некоторые sysctl не применились (ограничения VPS)'
+  SYSCTL_APPLIED=0
+  if sysctl -p "$TUNING_FILE"; then
+    SYSCTL_APPLIED=1
+  else
+    log 'ПРЕДУПРЕЖДЕНИЕ: некоторые sysctl не применились (ограничения ядра или контейнера)'
   fi
-  if ((SYSCTL_DRIFT && !TUNING_CHANGED)); then change 'восстановлены текущие значения sysctl'; fi
+  # Нельзя сообщать об успешном исправлении drift, если sysctl -p завершился ошибкой.
+  if ((SYSCTL_DRIFT && !TUNING_CHANGED && SYSCTL_APPLIED)); then
+    change 'восстановлены текущие значения sysctl'
+  fi
 fi
 
 download_verified() {
