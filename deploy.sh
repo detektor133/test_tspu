@@ -556,8 +556,9 @@ rollback_core() {
 if ((NEED_PANEL)); then
   if ((PANEL_BOOTSTRAP)); then
     if ! MUI_BINARY_PATH="$PANEL_BIN" bash "$INSTALLER_CACHE" \
-      --version "$PANEL_VERSION" --skip-mihomo --listen-ip 127.0.0.1 --port "$PANEL_PORT" --no-ssl |
-      tee "${TMP_DIR}/mui-bootstrap.log"; then
+      --version "$PANEL_VERSION" --skip-mihomo --listen-ip 127.0.0.1 --port "$PANEL_PORT" --no-ssl \
+      > "${TMP_DIR}/mui-bootstrap.log" 2>&1; then
+      sed -E '/^(Username|Password):/d' "${TMP_DIR}/mui-bootstrap.log" >&2
       rollback_core
       fail 'первичная установка m-ui завершилась ошибкой'
     fi
@@ -891,7 +892,7 @@ def add(inbound):
 ssname = 'test-tspu-ss'
 sspw = get_secret(ssname, 'password', token)
 add({'name': ssname, 'type': 'shadowsocks', 'port': 8388, 'listen': '0.0.0.0',
-     'cipher': 'chacha20-ietf-poly1305', 'password': sspw, 'udp': True})
+     'cipher': 'chacha20-ietf-poly1305', 'users': {'test': sspw}, 'udp': True})
 
 hyname = 'test-tspu-hysteria2'
 hypw = get_secret(hyname, 'password', token)
@@ -951,7 +952,57 @@ if created_count or tls_changed:
     print(f'Mihomo: применено новых inbounds: {created_count}; TLS обновлён: {tls_changed}')
 # m-ui сохраняет inbounds в state, изменения применяются через API.
 pathlib.Path(os.environ['INBOUNDS_COUNT_FILE']).write_text(str(created_count))
-print('Готово: inbounds сохранены через m-ui API')
+# m-ui умеет отдавать клиентские ссылки, Clash/Mihomo YAML и QR-страницу.
+# Важно: API /api/subscriptions/token каждый раз перевыпускает токен — не вращаем его.
+# Общий пользователь test применяется в семи созданных inbounds.
+latest_state = json.loads(PANEL.read_text())
+tokens = latest_state.get('subscriptionTokens') or {}
+for subscription_user in ('test', 'default'):
+    if not any(
+        (client.get('username') or client.get('name')) == subscription_user
+        for inbound in latest_state.get('inbounds', [])
+        for client in (inbound.get('clients') or [])
+    ):
+        continue
+    if not tokens.get(subscription_user):
+        created = api('POST', 'api/subscriptions/token', {'username': subscription_user})
+        if not isinstance(created, dict) or not created.get('token'):
+            raise RuntimeError('m-ui не выдала токен подписки')
+        tokens[subscription_user] = created['token']
+        print(f'Создан защищённый токен подписки для пользователя {subscription_user}')
+    else:
+        print(f'Без изменений: подписка пользователя {subscription_user}')
+settings = json.loads(PANEL.read_text())['settings']
+subpath = '/' + (settings.get('subscriptionPath') or '').strip('/')
+subpath = subpath.rstrip('/')
+clashpath = '/' + (settings.get('clashPath') or 'clash').strip('/')
+lines = [
+    '# Файл содержит секретные ссылки! Не копируйте в открытые логи и Git.',
+    '# Для QR-кодов откройте базовую страницу подписки в браузере.'
+]
+for subscription_user, token_value in sorted(tokens.items()):
+    if subscription_user not in ('test', 'default'):
+        continue
+    base = f'https://{host}:2053{subpath}/{token_value}'
+    lines.extend([
+        f'# Подписка: {subscription_user}',
+        f'QR/страница: {base}',
+        f'Mihomo/Clash: {base}{clashpath}',
+        f'Android v2rayNG: {base}/v2rayng',
+        f'Android HAPP: {base}/happ',
+        f'sing-box: {base}/sing-box',
+    ])
+dest = DIR / 'subscriptions.txt'
+new_content = '\n'.join(lines) + '\n'
+if not dest.exists() or dest.read_text() != new_content:
+    fd, file_name = tempfile.mkstemp(prefix='.subscriptions-', dir=DIR)
+    with os.fdopen(fd, 'w') as fp:
+        fp.write(new_content)
+    os.chmod(file_name, 0o600)
+    os.replace(file_name, dest)
+    print('Ссылки подписок сохранены: /var/lib/test-tspu/subscriptions.txt (0600)')
+print('Готово: inbounds и подписки сохранены в m-ui')
+
 PY
   then
     fail 'автоматическая настройка inbound завершилась ошибкой (проверьте вывод выше)'
