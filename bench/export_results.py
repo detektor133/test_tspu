@@ -25,9 +25,12 @@ def export(source, downloads):
         out = dest / file
         out.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, out)
-    print("Скопированы только обезличенные результаты: " + str(dest))
+    print("Скопированы только разрешённые файлы результатов: " + str(dest))
     print("Далее на ПК: adb pull /sdcard/Download/test-tspu-results/")
     print("private-mihomo.yaml, URL подписки и ключи НЕ экспортировались.")
+    if (source / "ip-results.csv").is_file():
+        print("ВНИМАНИЕ: IP-отчёт содержит реальный публичный адрес сети; "
+              "проверьте его перед публикацией.")
 
 
 if __name__ == "__main__":
