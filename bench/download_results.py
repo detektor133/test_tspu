@@ -57,7 +57,9 @@ def serve(outfile, port):
     with ThreadingHTTPServer(("127.0.0.1", port), Handler) as server:
         print("Открой в браузере ЭТОГО ЖЕ телефона:")
         print("http://127.0.0.1:%d/%s" % (port, quote(outfile.name)))
-        print("Архив содержит только разрешённые CSV/JSON/отчёт; секретов нет.")
+        print("Архив содержит только разрешённые CSV/JSON/отчёт; ключей и конфигов нет.")
+        if "-rostelecom-ip-" in outfile.name:
+            print("ВНИМАНИЕ: архив раскрывает публичный IP вашей сети.")
         print("После скачивания нажми Ctrl+C в Termux.", flush=True)
         try:
             server.serve_forever()
