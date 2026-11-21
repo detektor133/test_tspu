@@ -31,8 +31,8 @@ jobs:
       - name: Проверка Python-скриптов измерений
         run: |
           python3 -m py_compile bench/*.py
-          python3 -m py_compile tests/test_fieldbench.py
-          python3 -m unittest discover -s tests -p 'test_fieldbench.py' -v
+          python3 -m py_compile tests/test_*.py
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: ShellCheck
         run: shellcheck -S warning deploy.sh bench/setup_termux.sh tests/integration.sh tests/proxy-e2e.sh
       - name: Проверка аргументов и диагностики
