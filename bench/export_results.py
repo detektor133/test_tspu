@@ -6,7 +6,7 @@ import shutil
 
 ALLOWED = ("report.md", "environment.json", "measurements.csv",
            "request-samples.csv", "negative-controls.json", "time-windows.csv",
-           "server-resources.csv", "youtube-results.csv", "charts/throughput.svg", "charts/latency.svg",
+           "server-resources.csv", "youtube-results.csv", "ip-results.csv", "charts/throughput.svg", "charts/latency.svg",
            "charts/time-windows.svg")
 
 
