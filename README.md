@@ -190,11 +190,3 @@ GitHub Actions запускает реальные установки на **Ubu
 **В GitHub Actions нельзя проверить:** доступность сертификатного HTTP-01 с интернета, реальный выпуск/продление Let's Encrypt, сетевую фильтрацию и смену публичного IP у провайдера. Это остаётся задачей испытаний на целевом VPS.
 
 Источники: [m-ui](https://github.com/RomanovCaesar/m-ui), [Mihomo](https://github.com/MetaCubeX/mihomo), [Let's Encrypt: сертификаты для IP](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability/).
-## Анализ ТСПУ/DPI и выбор транспорта для задания AnyModel
-
-Исследовательская записка с первичными источниками по SNI, TLS, QUIC,
-WireGuard/OpenVPN/Shadowsocks и осторожным выбором Hysteria2 + резервного
-VLESS REALITY: **[research/anymodel-dpi-review.md](research/anymodel-dpi-review.md)**.
-В ней отдельно указано, что данные наших полевых тестов **не доказывают**
-конкретный механизм ТСПУ или максимальную выдерживаемую параллельность.
-
