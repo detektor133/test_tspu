@@ -108,6 +108,53 @@ class YouTubeProbeTests(TestCase):
         self.assertEqual(result[0], "bad_redirect")
         self.assertEqual(result[3], 0)
 
+    def test_tls_connection_reset_is_evidence_not_crash(self):
+        # Regression: Python 3.14 urllib wraps a TLS reset in URLError.
+        from urllib.error import URLError
+
+        class FailingOpener:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def open(self, req, timeout):
+                raise self.exc
+
+        for reset in (ConnectionResetError(104, "Connection reset by peer"),
+                      URLError(ConnectionResetError(104, "Connection reset by peer"))):
+            with mock.patch.object(yp, "_opener", return_value=FailingOpener(reset)):
+                state, status, elapsed, reason = yp.watch_page("jNQXAC9IVRw", None, 5)
+                self.assertEqual((state, status, reason),
+                                 ("page_failed", "", "connection_reset"))
+                self.assertGreaterEqual(elapsed, 0)
+
+                media, status, _, size, _, reason = yp.media_range(GOOD_CDN, None, 5)
+                self.assertEqual((media, status, size, reason),
+                                 ("media_failed", "", 0, "connection_reset"))
+
+        with mock.patch.object(yp, "watch_page", return_value=(
+                "page_failed", "", 15, "connection_reset")), \
+             mock.patch.object(yp, "extract_media_url", return_value=(
+                "", "extract_failed", "extractor_or_network_error")):
+            result = yp.probe("jNQXAC9IVRw", None, 5)
+        self.assertEqual(result["watch_status"], "page_failed")
+        self.assertEqual(result["watch_error_category"], "connection_reset")
+        self.assertEqual(result["extract_error_category"], "extractor_or_network_error")
+        self.assertEqual(result["error_category"], "connection_reset")
+        self.assertEqual(result["media_status"], "not_tested")
+
+    def test_https_error_recorded_as_http_status(self):
+        from urllib.error import HTTPError
+        exc = HTTPError(GOOD_CDN, 403, "Forbidden", {}, None)
+
+        class FailingOpener:
+            def open(self, req, timeout):
+                raise exc
+
+        with mock.patch.object(yp, "_opener", return_value=FailingOpener()):
+            self.assertEqual(yp.media_range(GOOD_CDN, None, 5)[:4],
+                             ("media_failed", 403, "", 0))
+            self.assertEqual(yp.watch_page("jNQXAC9IVRw", None, 5)[1], 403)
+
     def test_invalid_id_fails_before_network(self):
         with self.assertRaises(ValueError):
             yp.probe("https://youtube.com/watch?v=bad", None, 5)

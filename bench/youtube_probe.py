@@ -6,7 +6,9 @@ the HTTP range transfer is performed separately through that SAME path.
 No video, signed CDN URLs, YouTube cookies or extractor logs are retained.
 """
 import datetime as dt
-import http.client
+import http.client as http_client
+import errno
+import ssl
 import os
 import re
 import subprocess
@@ -19,7 +21,8 @@ MIME_PREFIXES = ("video/", "audio/", "application/octet-stream")
 FIELDS = [
     "network", "protocol", "port", "watch_status", "watch_http",
     "watch_ms", "extract_status", "media_status", "media_http",
-    "media_content_type", "media_bytes", "media_ms", "error_category",
+    "media_content_type", "media_bytes", "media_ms", "watch_error_category",
+    "extract_error_category", "error_category",
     "started_utc", "ended_utc",
 ]
 
@@ -47,11 +50,20 @@ def _opener(proxy):
 def _error_category(exc):
     if isinstance(exc, error.HTTPError):
         return "http_" + str(exc.code)
-    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+    # urllib wraps genuine socket/TLS failures in URLError. Keep the
+    # underlying symptom so a DIRECT reset is not mistaken for yt-dlp failure.
+    reason = exc.reason if isinstance(exc, error.URLError) else exc
+    if isinstance(reason, ConnectionResetError) or (
+            isinstance(reason, OSError) and reason.errno == errno.ECONNRESET):
+        return "connection_reset"
+    if isinstance(reason, (TimeoutError, subprocess.TimeoutExpired)) or (
+            isinstance(reason, OSError) and reason.errno == errno.ETIMEDOUT):
         return "timeout"
-    if isinstance(exc, error.URLError) and isinstance(exc.reason, TimeoutError):
-        return "timeout"
-    return type(exc).__name__
+    if isinstance(reason, ssl.SSLEOFError):
+        return "tls_unexpected_eof"
+    if isinstance(reason, ssl.SSLError):
+        return "tls_error"
+    return type(reason).__name__
 
 
 def watch_page(video_id, proxy, timeout):
@@ -71,9 +83,9 @@ def watch_page(video_id, proxy, timeout):
                   and b"<html" in body[:8192].lower())
             return ("page_ok" if ok else "page_unverified",
                     resp.status, round((time.monotonic() - begin) * 1000), "")
-    except (OSError, error.URLError, http.client.HTTPException, ValueError) as exc:
-        http = exc.code if isinstance(exc, error.HTTPError) else ""
-        return ("page_failed", http,
+    except (OSError, error.URLError, http_client.HTTPException, ValueError) as exc:
+        http_status = exc.code if isinstance(exc, error.HTTPError) else ""
+        return ("page_failed", http_status,
                 round((time.monotonic() - begin) * 1000), _error_category(exc))
 
 
@@ -151,9 +163,9 @@ def media_range(url, proxy, timeout, cap_bytes=1048576):
             return (status, http, mime, size,
                     round((time.monotonic() - begin) * 1000), "" if status == "media_bytes_ok"
                     else "short_media_response")
-    except (OSError, error.URLError, http.client.HTTPException, ValueError) as exc:
-        http = exc.code if isinstance(exc, error.HTTPError) else ""
-        return ("media_failed", http, "", 0,
+    except (OSError, error.URLError, http_client.HTTPException, ValueError) as exc:
+        http_status = exc.code if isinstance(exc, error.HTTPError) else ""
+        return ("media_failed", http_status, "", 0,
                 round((time.monotonic() - begin) * 1000), _error_category(exc))
 
 
@@ -175,6 +187,8 @@ def probe(video_id, proxy, timeout, cap_bytes=1048576):
         "extract_status": extract_status, "media_status": media,
         "media_http": media_http, "media_content_type": mime,
         "media_bytes": count, "media_ms": media_ms,
-        "error_category": media_error or page_error,
+        "watch_error_category": page_error,
+        "extract_error_category": extract_error,
+        "error_category": page_error or media_error,
         "started_utc": begin, "ended_utc": utcnow(),
     }
